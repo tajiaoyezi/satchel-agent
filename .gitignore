@@ -1,0 +1,13 @@
+# go build ./cmd/satchel-agent 的产物
+/satchel-agent
+/satchel-agent.exe
+/dist/
+*.test
+
+# 本地工具
+.idea/
+.vscode/
+.DS_Store
+.claude/
+.cursor/
+.agents/
