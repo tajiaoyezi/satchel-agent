@@ -6,6 +6,10 @@ Satchel（百宝袋）的节点守护进程，装在每台被管理的服务器�
 
 与主控共用的代码（securechan、xrpc、资源类型）放在 `satchel` 仓库的 `pkg/` 下，本仓库以 Go module 依赖引用固定版本，不复制第二份（技术方案第 02 章）。
 
+## 发布
+
+打 tag `v*` 触发 `.github/workflows/release.yml`：构建后签名 job 停在受保护环境 `release-signing` 等仓库拥有者批准，签名程序检出 `satchel` 仓库的 `tools/sign` 来跑（一把发布密钥签三个二进制），产物与 `.sig`、`checksums.txt` 挂到 GitHub Release。
+
 ## 构建
 
 ```sh

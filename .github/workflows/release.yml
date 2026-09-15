@@ -1,0 +1,140 @@
+name: Release
+
+# 节点守护的发布线（技术方案第 09 章、release-pipeline spec）：只出 linux amd64 / arm64（没有客户端用途）。
+# 签名程序 tools/sign 只在 satchel 仓库里一份，这里检出 satchel 的一个固定 tag 来跑它（satchel 是公开仓库，不需要令牌）。
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  BUILDINFO: github.com/satchel/satchel-agent/internal/buildinfo
+
+jobs:
+  build:
+    name: build linux/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goarch: amd64, output: satchel-agent-linux-amd64 }
+          - { goarch: arm64, output: satchel-agent-linux-arm64 }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: go build
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          commit="$(git rev-parse --short=12 HEAD)"
+          date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mkdir -p dist
+          go build -trimpath \
+            -ldflags="-s -w -X ${BUILDINFO}.Version=${version} -X ${BUILDINFO}.Commit=${commit} -X ${BUILDINFO}.Date=${date}" \
+            -o "dist/${{ matrix.output }}" ./cmd/satchel-agent
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.output }}
+          path: dist/${{ matrix.output }}
+          if-no-files-found: error
+          retention-days: 7
+
+  sign:
+    name: sign (needs approval)
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release-signing
+    steps:
+      - name: checkout satchel (signing tool lives there)
+        uses: actions/checkout@v7
+        with:
+          repository: tajiaoyezi/satchel
+          # 钉住签名程序所在的 satchel 版本：私钥会交给这份代码，不能用会动的 main。改它要有意识（换成新的 satchel tag）。
+          ref: v0.0.1-alpha.1
+          path: satchel
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: satchel/go.mod
+          cache-dependency-path: satchel/go.sum
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: sign every binary, then verify with the embedded public keys
+        env:
+          RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.RELEASE_SIGNING_PRIVATE_KEY }}
+          RELEASE_SIGNING_ARMED: ${{ vars.RELEASE_SIGNING_ARMED }}
+        run: |
+          # 工作流引用了不存在的 environment 时 GitHub 会自动建一个没有任何保护规则的同名环境，签名就不会等人批准；
+          # 所以要求环境上配了变量 RELEASE_SIGNING_ARMED=1（只在人手建好、设了审批人的环境上才有）。
+          test "${RELEASE_SIGNING_ARMED:-}" = "1" || { echo "::error::环境 release-signing 没有武装（缺变量 RELEASE_SIGNING_ARMED=1）：先按 README 建好受保护环境再发布"; exit 1; }
+          test -n "$RELEASE_SIGNING_PRIVATE_KEY" || { echo "::error::环境 release-signing 缺 secret RELEASE_SIGNING_PRIVATE_KEY"; exit 1; }
+          cd satchel
+          go run ./tools/sign sign ../dist/satchel-agent-*
+          for f in ../dist/satchel-agent-*; do
+            case "$f" in *.sig) continue ;; esac
+            go run ./tools/sign verify "$f" "$f.sig"
+            test "$(wc -c < "$f.sig")" -eq 64
+          done
+          cd ../dist
+          sha256sum satchel-agent-* > checksums.txt
+          cat checksums.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: signed
+          path: |
+            dist/satchel-agent-*
+            dist/checksums.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: github release
+    needs: sign
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: refuse to overwrite an existing release for this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "::error::tag $GITHUB_REF_NAME 已有 Release，发布线不覆盖已发布的资产；要重发请先删掉那个 Release"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: signed
+          path: release
+
+      - name: verify checksums before publishing
+        run: cd release && sha256sum -c checksums.txt
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release/satchel-agent-*
+            release/checksums.txt
