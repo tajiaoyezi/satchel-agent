@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   check:
@@ -24,10 +25,27 @@ jobs:
           fi
 
       - name: go vet
-        run: go vet ./...
+        run: go vet -tags with_quic ./...
 
       - name: go build
-        run: go build ./...
+        run: go build -tags with_quic ./...
 
       - name: go test
-        run: go test ./...
+        run: go test -tags with_quic ./...
+
+  # 内核五项证伪测试的完整版（m2-01，README「内核的编译标签」）：时间窗 30 秒、数据量按 MB 足量，本机跑一次约七分钟，
+  # 所以只在推送到 main 与手动触发时跑；是单独的 job，不挡上面的 check。
+  falsification:
+    name: kernel falsification (full)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: go test (falsification)
+        run: go test -tags with_quic,falsification -run Falsification -timeout 30m -v ./...
