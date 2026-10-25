@@ -23,12 +23,28 @@ jobs:
         include:
           - { goarch: amd64, output: satchel-agent-linux-amd64 }
           - { goarch: arm64, output: satchel-agent-linux-arm64 }
+    # 主控仓库的 pkg/ 经 replace 引用同级目录：同 CI，两个仓库检出成 satchel-agent/ 与 satchel/，satchel 钉在 .satchel-ref 的提交上。
+    defaults:
+      run:
+        working-directory: satchel-agent
     steps:
       - uses: actions/checkout@v7
+        with:
+          path: satchel-agent
+
+      - name: read pinned satchel commit
+        run: echo "SATCHEL_REF=$(tr -d '[:space:]' < .satchel-ref)" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: tajiaoyezi/satchel
+          ref: ${{ env.SATCHEL_REF }}
+          path: satchel
 
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version-file: satchel-agent/go.mod
+          cache-dependency-path: satchel-agent/go.sum
 
       - name: go build
         env:
@@ -47,7 +63,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.output }}
-          path: dist/${{ matrix.output }}
+          path: satchel-agent/dist/${{ matrix.output }}
           if-no-files-found: error
           retention-days: 7
 

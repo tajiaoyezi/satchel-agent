@@ -9,12 +9,29 @@ jobs:
   check:
     name: gofmt / vet / build / test
     runs-on: ubuntu-latest
+    # 主控仓库的 pkg/（securechan、xrpc）经 go.mod 的 replace 引用同级目录：两个仓库检出成 satchel-agent/ 与 satchel/，
+    # satchel 钉在 .satchel-ref 写的提交上（m2-02 design 第 1 条）。
+    defaults:
+      run:
+        working-directory: satchel-agent
     steps:
       - uses: actions/checkout@v7
+        with:
+          path: satchel-agent
+
+      - name: read pinned satchel commit
+        run: echo "SATCHEL_REF=$(tr -d '[:space:]' < .satchel-ref)" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: tajiaoyezi/satchel
+          ref: ${{ env.SATCHEL_REF }}
+          path: satchel
 
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version-file: satchel-agent/go.mod
+          cache-dependency-path: satchel-agent/go.sum
 
       - name: gofmt
         run: |
@@ -40,12 +57,29 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    # 主控仓库的 pkg/（securechan、xrpc）经 go.mod 的 replace 引用同级目录：两个仓库检出成 satchel-agent/ 与 satchel/，
+    # satchel 钉在 .satchel-ref 写的提交上（m2-02 design 第 1 条）。
+    defaults:
+      run:
+        working-directory: satchel-agent
     steps:
       - uses: actions/checkout@v7
+        with:
+          path: satchel-agent
+
+      - name: read pinned satchel commit
+        run: echo "SATCHEL_REF=$(tr -d '[:space:]' < .satchel-ref)" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: tajiaoyezi/satchel
+          ref: ${{ env.SATCHEL_REF }}
+          path: satchel
 
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version-file: satchel-agent/go.mod
+          cache-dependency-path: satchel-agent/go.sum
 
       - name: go test (falsification)
         run: go test -tags with_quic,falsification -run Falsification -timeout 30m -v ./...
