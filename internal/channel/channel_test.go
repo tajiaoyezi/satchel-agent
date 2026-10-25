@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,11 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/satchel/satchel/pkg/xrpc"
+
+	"github.com/satchel/satchel-agent/internal/control"
+	"github.com/satchel/satchel-agent/internal/kernel"
+	"github.com/satchel/satchel-agent/internal/limits"
+	"github.com/satchel/satchel-agent/internal/tracker"
 )
 
 // fakeMaster 是测试里的主控：用 pkg/xrpc 握手、认证、收心跳，能按需拒绝认证、向节点发请求（m2-02 design 第 10 条）。
@@ -36,7 +42,7 @@ type fakeMaster struct {
 
 	auths      chan xrpc.Auth
 	heartbeats chan time.Time
-	callers    chan func(method string) (json.RawMessage, error)
+	callers    chan func(method string, params any) (json.RawMessage, error)
 	raw        chan []byte
 	rawEnd     chan error // rawOnly 时连接读到错误（节点断开）就送一次
 }
@@ -44,7 +50,7 @@ type fakeMaster struct {
 func newFakeMaster(t *testing.T) *fakeMaster {
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
 	m := &fakeMaster{t: t, priv: priv, interval: 30, auths: make(chan xrpc.Auth, 64), heartbeats: make(chan time.Time, 64),
-		callers: make(chan func(string) (json.RawMessage, error), 8), raw: make(chan []byte, 64), rawEnd: make(chan error, 8)}
+		callers: make(chan func(string, any) (json.RawMessage, error), 8), raw: make(chan []byte, 64), rawEnd: make(chan error, 8)}
 	m.listen("127.0.0.1:0")
 	t.Cleanup(m.stop)
 	return m
@@ -121,8 +127,8 @@ func (m *fakeMaster) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = conn.Write(ctx, xrpc.TypeAuthResult, xrpc.AuthResult{OK: true, HeartbeatInterval: m.interval})
 	caller := xrpc.NewCaller()
-	m.callers <- func(method string) (json.RawMessage, error) {
-		return caller.Call(context.Background(), conn, method, nil, 5*time.Second)
+	m.callers <- func(method string, params any) (json.RawMessage, error) {
+		return caller.Call(context.Background(), conn, method, params, 5*time.Second)
 	}
 	for {
 		msg, err := conn.Read(ctx)
@@ -240,13 +246,13 @@ func TestAuthHeartbeatAndInfo(t *testing.T) {
 		t.Fatalf("心跳间隔应当约 1 秒：%v", gap)
 	}
 	call := <-m.callers
-	raw, err := call(xrpc.MethodAgentInfo)
+	raw, err := call(xrpc.MethodAgentInfo, nil)
 	var info xrpc.AgentInfo
 	if err != nil || json.Unmarshal(raw, &info) != nil || info.AgentVersion != "9.9.9" || info.ControlProtocol != xrpc.ControlProtocol {
 		t.Fatalf("agent.info：%s %v", raw, err)
 	}
 	var rerr *xrpc.Error
-	if _, err := call("no.such"); !errors.As(err, &rerr) || rerr.Code != xrpc.CodeUnknownMethod {
+	if _, err := call("no.such", nil); !errors.As(err, &rerr) || rerr.Code != xrpc.CodeUnknownMethod {
 		t.Fatalf("不认识的方法应当回 unknown_method：%v", err)
 	}
 }
@@ -311,5 +317,111 @@ func TestAuthFailureBackoff(t *testing.T) {
 		if i >= len(waits) || waits[i] != wantPlain[i] {
 			t.Fatalf("普通失败的等待应当是 %v，得到 %v", wantPlain, waits)
 		}
+	}
+}
+
+// node-limiter「通道上的连接管控方法」：主控经通道调五个方法，tracker 是真的、不起内核。
+func TestControlMethodsOverChannel(t *testing.T) {
+	newClient := func(inbounds []string) func(string, any) (json.RawMessage, error) {
+		t.Helper()
+		m := newFakeMaster(t)
+		tr := tracker.New()
+		store, err := limits.Open(filepath.Join(t.TempDir(), limits.FileName), tr, time.Now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		methods := control.Methods(control.Deps{Limits: store, Tracker: tr, Kernel: kernel.New(tr), Inbounds: inbounds})
+		runClient(t, Config{MasterURL: m.url(), Token: "tok", MasterKey: m.pub(), AgentVersion: "1.0.0", Methods: methods})
+		waitAuth(t, m)
+		return <-m.callers
+	}
+	badParams := func(err error) bool {
+		var e *xrpc.Error
+		return errors.As(err, &e) && e.Code == xrpc.CodeBadParams
+	}
+	state := func(raw json.RawMessage, err error) xrpc.LimiterState {
+		t.Helper()
+		var st xrpc.LimiterState
+		if err != nil || json.Unmarshal(raw, &st) != nil {
+			t.Fatalf("回复不对：%s %v", raw, err)
+		}
+		return st
+	}
+	call := newClient([]string{"vless-in", "hy2-in"})
+	set := func(source string, mbps int64) (json.RawMessage, error) {
+		return call(xrpc.MethodLimiterSet, xrpc.LimiterSetParams{Inbound: "vless-in", Credential: "a", Source: source, BPS: mbps * 1_000_000})
+	}
+	// 来源不认识：拒绝、状态不变。
+	if _, err := set("boss", 5); !badParams(err) {
+		t.Fatalf("来源 boss 应当回参数不合法：%v", err)
+	}
+	// 三份来源取最小，撤掉主控临时以后由剩下的重新算。
+	state(set(xrpc.SourceStatic, 10))
+	if st := state(set(xrpc.SourceMaster, 5)); len(st.Sources) != 2 || st.EffectiveBPS != 5_000_000 {
+		t.Fatalf("来源 boss 不应当改动状态，静态 10、主控临时 5 → 5：%+v", st)
+	}
+	state(set(xrpc.SourceNodeRule, 8))
+	st := state(call(xrpc.MethodLimiterUnset, xrpc.LimiterUnsetParams{Inbound: "vless-in", Credential: "a", Source: xrpc.SourceMaster}))
+	if st.EffectiveBPS != 8_000_000 || len(st.Sources) != 2 {
+		t.Fatalf("撤掉主控临时以后应当是 8 Mbps：%+v", st)
+	}
+	// 入站不存在、凭据名为空、值为负：都拒绝。
+	if _, err := call(xrpc.MethodLimiterSet, xrpc.LimiterSetParams{Inbound: "nope", Credential: "a", Source: xrpc.SourceMaster, BPS: 1}); !badParams(err) ||
+		!strings.Contains(err.Error(), "nope") {
+		t.Fatalf("入站不存在应当回参数不合法：%v", err)
+	}
+	if _, err := call(xrpc.MethodLimiterSet, xrpc.LimiterSetParams{Inbound: "vless-in", Source: xrpc.SourceMaster, BPS: 1}); !badParams(err) {
+		t.Fatalf("凭据名为空应当回参数不合法：%v", err)
+	}
+	if _, err := set(xrpc.SourceMaster, -1); !badParams(err) {
+		t.Fatalf("负数应当回参数不合法：%v", err)
+	}
+	// 没给 bps 不能当成 0（那会静默解除已有的限速）；截止时间是零值或已经过了也拒绝。三种都不改状态。
+	state(set(xrpc.SourceMaster, 5))
+	if _, err := call(xrpc.MethodLimiterSet, map[string]string{"inbound": "vless-in", "credential": "a", "source": "master"}); !badParams(err) ||
+		!strings.Contains(err.Error(), "bps") {
+		t.Fatalf("没给 bps 应当回参数不合法：%v", err)
+	}
+	for _, d := range []time.Time{{}, time.Now().Add(-time.Minute)} {
+		if _, err := call(xrpc.MethodLimiterSet, xrpc.LimiterSetParams{Inbound: "vless-in", Credential: "a", Source: xrpc.SourceMaster, BPS: 1, Deadline: &d}); !badParams(err) ||
+			!strings.Contains(err.Error(), "已经过了") {
+			t.Fatalf("截止时间 %v 应当回参数不合法：%v", d, err)
+		}
+	}
+	if st := state(set(xrpc.SourceStatic, 10)); st.EffectiveBPS != 5_000_000 || st.Sources[1].BPS != 5_000_000 || st.Sources[1].Deadline != nil {
+		t.Fatalf("被拒的请求不应当改动主控临时的 5 Mbps：%+v", st)
+	}
+	// 合法的边界：值为 0（这一份显式不限速）与将来的截止时间都能设上，回复里带着它们。
+	if st := state(set(xrpc.SourceMaster, 0)); len(st.Sources) != 3 || st.Sources[1].BPS != 0 || st.EffectiveBPS != 8_000_000 {
+		t.Fatalf("主控临时设成 0 应当成功、退出取最小（剩静态 10 与节点规则 8）：%+v", st)
+	}
+	future := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	st = state(call(xrpc.MethodLimiterSet, xrpc.LimiterSetParams{Inbound: "vless-in", Credential: "a", Source: xrpc.SourceMaster, BPS: 4_000_000, Deadline: &future}))
+	if st.Sources[1].Deadline == nil || !st.Sources[1].Deadline.Equal(future) || st.EffectiveBPS != 4_000_000 {
+		t.Fatalf("将来的截止时间应当能设上：%+v", st)
+	}
+	// 没有连接时列连接是空列表、踢线 0 条。
+	raw, err := call(xrpc.MethodConnectionsList, xrpc.ConnectionsListParams{Inbound: "vless-in", Credential: "a"})
+	if err != nil || !strings.Contains(string(raw), `"connections":[]`) {
+		t.Fatalf("没有连接时应当是空列表：%s %v", raw, err)
+	}
+	if raw, err := call(xrpc.MethodConnectionsKick, xrpc.ConnectionsKickParams{Credential: "a"}); err != nil || !strings.Contains(string(raw), `"kicked":0`) {
+		t.Fatalf("没有连接时踢 0 条：%s %v", raw, err)
+	}
+	// 快照：内核没在跑。
+	raw, err = call(xrpc.MethodTrafficSnapshot, nil)
+	var snap xrpc.TrafficSnapshot
+	if err != nil || json.Unmarshal(raw, &snap) != nil || snap.KernelRunning || snap.BootID == "" || snap.KernelStartedAt != nil {
+		t.Fatalf("没起内核时快照应当报内核没在跑：%s %v", raw, err)
+	}
+
+	// 没有内核配置：limiter.set 回「节点没有内核配置」，快照照常回。
+	call = newClient(nil)
+	if _, err := call(xrpc.MethodLimiterSet, xrpc.LimiterSetParams{Inbound: "vless-in", Credential: "a", Source: xrpc.SourceMaster, BPS: 1}); !badParams(err) ||
+		!strings.Contains(err.Error(), "没有内核配置") {
+		t.Fatalf("没有内核配置时应当拒绝：%v", err)
+	}
+	if _, err := call(xrpc.MethodTrafficSnapshot, nil); err != nil {
+		t.Fatalf("没有内核配置时快照照常回：%v", err)
 	}
 }

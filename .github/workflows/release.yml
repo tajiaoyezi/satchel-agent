@@ -56,7 +56,7 @@ jobs:
           commit="$(git rev-parse --short=12 HEAD)"
           date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           mkdir -p dist
-          go build -trimpath \
+          go build -trimpath -tags with_quic \
             -ldflags="-s -w -X ${BUILDINFO}.Version=${version} -X ${BUILDINFO}.Commit=${commit} -X ${BUILDINFO}.Date=${date}" \
             -o "dist/${{ matrix.output }}" ./cmd/satchel-agent
 

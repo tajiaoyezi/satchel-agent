@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"strings"
 	"time"
@@ -50,8 +51,10 @@ type Config struct {
 	Token        string
 	MasterKey    ed25519.PublicKey
 	AgentVersion string
-	Logger       *slog.Logger
-	Backoff      Backoff
+	// Methods 是 agent.info 之外节点回应的方法（连接管控与流量，见 internal/control）。
+	Methods xrpc.Methods
+	Logger  *slog.Logger
+	Backoff Backoff
 	// Sleep 等待 d 或 ctx 结束（测试里换成记录等待时长、立即返回）。
 	Sleep func(ctx context.Context, d time.Duration) error
 }
@@ -95,6 +98,7 @@ func New(cfg Config) *Client {
 			return xrpc.AgentInfo{AgentVersion: cfg.AgentVersion, ControlProtocol: xrpc.ControlProtocol}, nil
 		},
 	}
+	maps.Copy(c.methods, cfg.Methods)
 	return c
 }
 

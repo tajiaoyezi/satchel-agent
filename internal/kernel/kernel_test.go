@@ -1,10 +1,16 @@
 package kernel_test
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,8 +93,8 @@ func TestFailedStartNotCounted(t *testing.T) {
 	if err := k.Start(context.Background(), config); err == nil {
 		t.Fatal("端口被占时启动应当失败")
 	}
-	if g := k.Tracker().Generation(); g != 0 || k.Running() {
-		t.Fatalf("启动失败后内核代数应当还是 0、内核不在跑：%d %v", g, k.Running())
+	if g := k.Tracker().Generation(); g != 0 || k.Running() || !k.StartedAt().IsZero() {
+		t.Fatalf("启动失败后内核代数应当还是 0、内核不在跑、没有启动时间：%d %v %v", g, k.Running(), k.StartedAt())
 	}
 	ln.Close()
 	if err := k.Start(context.Background(), config); err != nil {
@@ -98,6 +104,36 @@ func TestFailedStartNotCounted(t *testing.T) {
 	if g := k.Tracker().Generation(); g != 1 {
 		t.Fatalf("端口放开后启动成功，内核代数应当是 1：%d", g)
 	}
+	first := k.StartedAt()
+	if first.IsZero() {
+		t.Fatal("启动成功后应当有启动时间")
+	}
+	k.Stop()
+	if !k.StartedAt().Equal(first) {
+		t.Fatal("停掉以后启动时间仍是那一次")
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := k.Start(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+	if !k.StartedAt().After(first) {
+		t.Fatalf("再启动一次，启动时间应当变新：%v → %v", first, k.StartedAt())
+	}
+}
+
+// kernel.Version 与 go.mod 里引用的 sing-box 版本一致。
+func TestVersionMatchesGoMod(t *testing.T) {
+	mod, err := os.ReadFile("../../go.mod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "github.com/sagernet/sing-box v" + kernel.Version
+	for _, line := range strings.Split(string(mod), "\n") {
+		if strings.TrimSpace(line) == want {
+			return
+		}
+	}
+	t.Fatalf("go.mod 里应当有一行 %q：升级 sing-box 时要同时改 kernel.Version", want)
 }
 
 // agent-kernel「所有入站共用一个挂接点」：A 经两个入站各开 TCP 与 UDP，tracker 看到四类连接，入站、凭据、出站都对。
@@ -124,4 +160,94 @@ func TestHooksSeeAllPaths(t *testing.T) {
 		t.Fatalf("B 没有连接：%+v", got)
 	}
 	_ = tracker.SourceStatic
+}
+
+// hangingRuleSet 起一个收到请求就挂着不回的 HTTP 服务，返回一份要从它下载远程规则集的 sing-box 配置与「收到请求」的通知。
+func hangingRuleSet(t *testing.T) ([]byte, <-chan struct{}) {
+	t.Helper()
+	hit, release := make(chan struct{}, 1), make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case hit <- struct{}{}:
+		default:
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { close(release); srv.Close() })
+	config := fmt.Sprintf(`{"log":{"disabled":true},"outbounds":[{"type":"direct","tag":"direct"}],`+
+		`"route":{"rule_set":[{"type":"remote","tag":"rs","format":"binary","url":"%s/rs.srs"}],"rules":[{"rule_set":["rs"],"action":"route","outbound":"direct"}]}}`, srv.URL)
+	return []byte(config), hit
+}
+
+// 启动期间取消：卡在下载远程规则集时 ctx 结束，Start 很快返回 ctx 的错误，内核不在跑、内核代数还是 0。
+func TestStartCancelledDuringStartup(t *testing.T) {
+	config, hit := hangingRuleSet(t)
+	k := kernel.New(tracker.New())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- k.Start(ctx, config) }()
+	select {
+	case <-hit:
+	case <-time.After(5 * time.Second):
+		t.Fatal("内核启动时应当去下载远程规则集")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("应当返回 ctx 被取消的错误：%v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("启动期间取消，Start 应当很快返回")
+	}
+	if k.Running() || k.Tracker().Generation() != 0 {
+		t.Fatalf("取消之后内核不应当在跑、代数还是 0：%v %d", k.Running(), k.Tracker().Generation())
+	}
+}
+
+// 启动成功以后再取消 ctx，内核照常工作：ctx 只管启动这一段。用真流量查：入站经 direct 出站连到本地的回显服务，取消之后
+// 发一行要原样收回来（只看端口还在听不够：实例跟着 ctx 被取消时端口还在，出站拨号却会报 operation was canceled）。
+func TestStartContextOnlyCoversStartup(t *testing.T) {
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		for {
+			c, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func() { defer c.Close(); io.Copy(c, c) }()
+		}
+	}()
+	port := kt.FreePort(t)
+	config := []byte(fmt.Sprintf(`{"log":{"disabled":true},"inbounds":[{"type":"direct","tag":"in","listen":"127.0.0.1",`+
+		`"listen_port":%d,"network":"tcp","override_address":"127.0.0.1","override_port":%d}],"outbounds":[{"type":"direct","tag":"out"}]}`,
+		port, echo.Addr().(*net.TCPAddr).Port))
+	k := kernel.New(tracker.New())
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := k.Start(ctx, config); err != nil {
+		t.Fatal(err)
+	}
+	defer k.Stop()
+	cancel()
+	time.Sleep(200 * time.Millisecond)
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("取消 ctx 之后入站应当还在听：%v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(conn, "ping\n"); err != nil {
+		t.Fatal(err)
+	}
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil || line != "ping\n" || !k.Running() {
+		t.Fatalf("取消 ctx 之后内核应当照常转发：%q %v %v", line, err, k.Running())
+	}
 }

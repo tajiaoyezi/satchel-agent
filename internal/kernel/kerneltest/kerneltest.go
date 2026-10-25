@@ -92,6 +92,9 @@ func (s *Server) start(t testing.TB) {
 	}
 }
 
+// Config 返回服务端内核用的 sing-box 配置（JSON），可以写成 kernel.json 交给别的内核起同样的入站。
+func (s *Server) Config() []byte { return s.config }
+
 // Tracker 返回服务端的 tracker。
 func (s *Server) Tracker() *tracker.Tracker { return s.Kernel.Tracker() }
 
