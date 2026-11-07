@@ -24,8 +24,8 @@ import (
 	"github.com/satchel/satchel-agent/internal/tracker"
 )
 
-// kernelConfig 是内核配置（一份 sing-box 配置）的文件名，与 config.yaml 放在同一个目录；改了要重启 satchel-agent 才生效。
-const kernelConfig = "kernel.json"
+// kernelConfig 是内核配置（一份 sing-box 配置）的文件名，与 config.yaml 放在同一个目录；改了执行 server restart-kernel 或重启 satchel-agent 生效。
+const kernelConfig = control.KernelConfig
 
 const usage = `用法：
   satchel-agent join --master-url <url> --token <token> --master-key <key> --mode <mode> [--config <path>]
@@ -129,11 +129,14 @@ func serve(args []string, stderr io.Writer) int {
 }
 
 // runAgent 按配置目录起内核、给通道装上连接管控的方法、连主控，直到 ctx 结束；结束时先断通道（Run 返回时已断开）、
-// 再停内核。返回退出码。serve 只负责读配置与接信号。
+// 先取消内核启动用的 ctx、再停内核。返回退出码。serve 只负责读配置与接信号。
 func runAgent(ctx context.Context, dir string, cfg channel.Config, logger *slog.Logger) int {
-	deps, k := startKernel(ctx, dir, logger)
+	kernelCtx, cancelKernel := context.WithCancel(ctx)
+	defer cancelKernel()
+	deps, k := startKernel(kernelCtx, dir, logger)
 	cfg.Methods = control.Methods(deps)
 	err := channel.New(cfg).Run(ctx)
+	cancelKernel()
 	logger.Info("已断开主控，停内核")
 	if serr := k.Stop(); serr != nil {
 		logger.Warn("停内核出错", "err", serr)
@@ -148,7 +151,7 @@ func runAgent(ctx context.Context, dir string, cfg channel.Config, logger *slog.
 
 // startKernel 按配置目录准备连接管控（agent-kernel「run 按本地配置起内核」，m2-03 design 第 2 条）：先把 limiter-state.json
 // 里的限速来源重放进 tracker，再按 kernel.json 起内核。状态文件坏了、内核配置解析不了或内核起不来都只记日志，不影响连主控。
-// ctx 只管内核启动这一段：启动期间收到退出信号就放弃启动。
+// ctx 只管内核启动（含随后 kernel.restart 的启动）：启动期间收到退出信号就放弃启动。
 func startKernel(ctx context.Context, dir string, logger *slog.Logger) (control.Deps, *kernel.Kernel) {
 	tr := tracker.New()
 	store, err := limits.Open(filepath.Join(dir, limits.FileName), tr, time.Now)
@@ -156,22 +159,18 @@ func startKernel(ctx context.Context, dir string, logger *slog.Logger) (control.
 		logger.Error("限速状态没能完整读回或重写（读回了的已经生效，下次改动时会重写这个文件）", "err", err)
 	}
 	k := kernel.New(tr)
-	deps := control.Deps{Limits: store, Tracker: tr, Kernel: k}
-	config, err := os.ReadFile(filepath.Join(dir, kernelConfig))
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		logger.Info("配置目录里没有 " + kernelConfig + "，不起内核")
-		return deps, k
-	case err != nil:
-		logger.Error("读内核配置失败，不起内核", "err", err)
-		return deps, k
-	}
-	tags, err := kernel.InboundTags(config)
+	inbounds := control.NewInbounds(nil)
+	deps := control.Deps{Limits: store, Tracker: tr, Kernel: k, Inbounds: inbounds, KernelCtx: ctx, ConfigDir: dir}
+	config, tags, err := control.ReadKernelConfig(dir)
 	if err != nil {
-		logger.Error(kernelConfig+" 解析不了，不起内核", "err", err)
+		if errors.Is(err, os.ErrNotExist) {
+			logger.Info("配置目录里没有 " + kernelConfig + "，不起内核")
+		} else {
+			logger.Error("内核配置不可用，不起内核", "err", err)
+		}
 		return deps, k
 	}
-	deps.Inbounds = tags
+	inbounds.Set(tags)
 	if err := k.Start(ctx, config); err != nil {
 		logger.Error("内核起不来，只连主控", "err", err)
 		return deps, k

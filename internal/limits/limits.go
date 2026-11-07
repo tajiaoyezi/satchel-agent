@@ -133,7 +133,7 @@ func (s *Store) Set(inbound, credential, source string, bps int64, deadline *tim
 		return xrpc.LimiterState{}, ErrExpired
 	}
 	k := key{inbound, credential}
-	next := s.snapshot()
+	next := s.snapshot(at)
 	m := next[k]
 	if m == nil {
 		m = map[string]value{}
@@ -164,7 +164,7 @@ func (s *Store) Unset(inbound, credential, source string) (xrpc.LimiterState, er
 	defer s.mu.Unlock()
 	at := s.now()
 	k := key{inbound, credential}
-	next := s.snapshot()
+	next := s.snapshot(at)
 	delete(next[k], source)
 	if len(next[k]) == 0 {
 		delete(next, k)
@@ -179,15 +179,20 @@ func (s *Store) Unset(inbound, credential, source string) (xrpc.LimiterState, er
 	return s.stateLocked(k, at), nil
 }
 
-// snapshot 复制一份当前状态（调用方持锁）。
-func (s *Store) snapshot() map[key]map[string]value {
+// snapshot 复制一份当前没过期的状态（调用方持锁）。
+func (s *Store) snapshot(at time.Time) map[key]map[string]value {
 	out := make(map[key]map[string]value, len(s.entries))
 	for k, m := range s.entries {
 		c := make(map[string]value, len(m))
 		for src, v := range m {
+			if v.deadline != nil && !v.deadline.After(at) {
+				continue
+			}
 			c[src] = v
 		}
-		out[k] = c
+		if len(c) > 0 {
+			out[k] = c
+		}
 	}
 	return out
 }

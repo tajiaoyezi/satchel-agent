@@ -2,7 +2,6 @@ package kerneltest
 
 import (
 	"bufio"
-	"fmt"
 	"io"
 	"net"
 	"sort"
@@ -24,11 +23,10 @@ type Relay struct {
 	peers map[string]string // 连服务端用的本地地址 → 网络类型（认不出时为空）
 }
 
-// StartRelay 在 127.0.0.1 上起一个转发，network 是 "tcp" 或 "udp"，转到本机的 target 端口。测试结束时关掉。
-func StartRelay(t testing.TB, network string, target int) *Relay {
+// StartRelay 在 127.0.0.1 上起一个转发，network 是 "tcp" 或 "udp"，转到 target（host:port）。测试结束时关掉。
+func StartRelay(t testing.TB, network, target string) *Relay {
 	t.Helper()
 	r := &Relay{peers: map[string]string{}}
-	addr := fmt.Sprintf("127.0.0.1:%d", target)
 	switch network {
 	case "tcp":
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -37,7 +35,7 @@ func StartRelay(t testing.TB, network string, target int) *Relay {
 		}
 		r.Port = ln.Addr().(*net.TCPAddr).Port
 		t.Cleanup(func() { ln.Close() })
-		go r.serveTCP(ln, addr)
+		go r.serveTCP(ln, target)
 	case "udp":
 		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 		if err != nil {
@@ -45,7 +43,7 @@ func StartRelay(t testing.TB, network string, target int) *Relay {
 		}
 		r.Port = pc.LocalAddr().(*net.UDPAddr).Port
 		t.Cleanup(func() { pc.Close() })
-		go r.serveUDP(pc, addr)
+		go r.serveUDP(pc, target)
 	default:
 		t.Fatalf("不认识的网络 %q", network)
 	}

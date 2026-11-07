@@ -55,12 +55,18 @@ type Sink struct {
 // StartSink 在 127.0.0.1 上起一个收发流量的服务，测试结束时关掉。
 func StartSink(t testing.TB) *Sink {
 	t.Helper()
-	port := FreePort(t)
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	return StartSinkAt(t, "127.0.0.1", FreePort(t))
+}
+
+// StartSinkAt 在给定的监听地址与端口上起一个收发流量的服务，测试结束时关掉。
+func StartSinkAt(t testing.TB, host string, port int) *Sink {
+	t.Helper()
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pc, err := net.ListenPacket("udp", fmt.Sprintf("127.0.0.1:%d", port))
+	pc, err := net.ListenPacket("udp", addr)
 	if err != nil {
 		ln.Close()
 		t.Fatal(err)

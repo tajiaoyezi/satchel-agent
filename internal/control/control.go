@@ -1,6 +1,6 @@
-// Package control 是节点上连接管控与流量的通道方法（m2-03 design 第 4 条，node-limiter「通道上的连接管控方法」、
-// node-traffic「定时拉取计数快照」）：校验参数后交给限速来源的存储（internal/limits）与 tracker。参数问题一律回
-// xrpc.CodeBadParams，主控据此报 bad_request 并带上这里给的原因。
+// Package control 是节点上连接管控、流量与重启内核的通道方法（m2-03 design 第 4 条，node-limiter「通道上的连接管控方法」、
+// node-traffic「定时拉取计数快照」；m2-04 design 第 2 条，agent-kernel「重启内核」）：校验参数后交给限速来源的存储
+// （internal/limits）、tracker 与内核。参数问题一律回 xrpc.CodeBadParams，主控据此报 bad_request 并带上这里给的原因。
 package control
 
 import (
@@ -8,8 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/satchel/satchel/pkg/xrpc"
@@ -19,14 +22,67 @@ import (
 	"github.com/satchel/satchel-agent/internal/tracker"
 )
 
-// Deps 是这些方法的依赖。Inbounds 是 kernel.json 里的入站名（kernel.InboundTags）；为 nil 表示节点没有可用的内核配置
-// （文件不存在或解析不了）。Now 为空时用 time.Now。
+// KernelConfig 是内核配置（一份 sing-box 配置）的文件名，与 config.yaml 放在同一个目录。
+const KernelConfig = "kernel.json"
+
+// ReadKernelConfig 读 dir 下的 kernel.json 并解析入站名。文件不存在、读不了或解析不了时返回错误。
+func ReadKernelConfig(dir string) ([]byte, []string, error) {
+	if dir == "" {
+		return nil, nil, fmt.Errorf("配置目录里没有 %s：%w", KernelConfig, os.ErrNotExist)
+	}
+	config, err := os.ReadFile(filepath.Join(dir, KernelConfig))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil, fmt.Errorf("配置目录里没有 %s：%w", KernelConfig, err)
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("读 %s 失败：%w", KernelConfig, err)
+	}
+	tags, err := kernel.InboundTags(config)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s 解析不了：%w", KernelConfig, err)
+	}
+	return config, tags, nil
+}
+
+// Inbounds 存当前内核配置里的入站名（kernel.InboundTags），带锁供重启内核更新、连接管控方法读取；
+// 切片为 nil 表示节点没有可用的内核配置（文件不存在或解析不了）。
+type Inbounds struct {
+	mu   sync.RWMutex
+	tags []string
+}
+
+// NewInbounds 用给定的入站名建一份 Inbounds（tags 为 nil 表示没有可用的内核配置）。
+func NewInbounds(tags []string) *Inbounds {
+	return &Inbounds{tags: slices.Clone(tags)}
+}
+
+// Get 返回当前入站名的副本（没有可用的内核配置时返回 nil）。
+func (in *Inbounds) Get() []string {
+	if in == nil {
+		return nil
+	}
+	in.mu.RLock()
+	defer in.mu.RUnlock()
+	return slices.Clone(in.tags)
+}
+
+// Set 更新入站名。
+func (in *Inbounds) Set(tags []string) {
+	in.mu.Lock()
+	in.tags = slices.Clone(tags)
+	in.mu.Unlock()
+}
+
+// Deps 是这些方法的依赖。Inbounds 存 kernel.json 里的入站名；KernelCtx 是内核启动用的 context（随进程退出取消，
+// 不随通道连接取消）；ConfigDir 是放 kernel.json 的目录。Now 为空时用 time.Now。
 type Deps struct {
-	Limits   *limits.Store
-	Tracker  *tracker.Tracker
-	Kernel   *kernel.Kernel
-	Inbounds []string
-	Now      func() time.Time
+	Limits    *limits.Store
+	Tracker   *tracker.Tracker
+	Kernel    *kernel.Kernel
+	Inbounds  *Inbounds
+	KernelCtx context.Context
+	ConfigDir string
+	Now       func() time.Time
 }
 
 func badParams(format string, args ...any) *xrpc.Error {
@@ -41,12 +97,21 @@ func decode(raw json.RawMessage, v any) error {
 	return nil
 }
 
-func (d Deps) checkInbound(tag string) error {
-	if d.Inbounds == nil {
-		return badParams("节点没有内核配置（配置目录里没有可用的 kernel.json）")
+func (d Deps) checkHasKernel() ([]string, error) {
+	tags := d.Inbounds.Get()
+	if tags == nil {
+		return nil, badParams("节点没有内核配置（配置目录里没有可用的 kernel.json）")
 	}
-	if !slices.Contains(d.Inbounds, tag) {
-		return badParams("节点上没有入站 %q（内核配置里的入站：%s）", tag, strings.Join(d.Inbounds, "、"))
+	return tags, nil
+}
+
+func (d Deps) checkInbound(tag string) error {
+	tags, err := d.checkHasKernel()
+	if err != nil {
+		return err
+	}
+	if !slices.Contains(tags, tag) {
+		return badParams("节点上没有入站 %q（内核配置里的入站：%s）", tag, strings.Join(tags, "、"))
 	}
 	return nil
 }
@@ -56,6 +121,13 @@ func (d Deps) now() time.Time {
 		return d.Now()
 	}
 	return time.Now()
+}
+
+func (d Deps) kernelCtx() context.Context {
+	if d.KernelCtx != nil {
+		return d.KernelCtx
+	}
+	return context.Background()
 }
 
 func checkCredential(credential string) error {
@@ -72,8 +144,11 @@ func checkSource(source string) error {
 	return nil
 }
 
-// Methods 返回五个方法的处理函数。
+// Methods 返回六个方法的处理函数。
 func Methods(d Deps) xrpc.Methods {
+	if d.Inbounds == nil {
+		d.Inbounds = NewInbounds(nil)
+	}
 	return xrpc.Methods{
 		xrpc.MethodLimiterSet: func(_ context.Context, raw json.RawMessage) (any, error) {
 			// 外层的 BPS 是指针，用来分出「没给」与「给了 0」（0 是显式不限速，没给不能当成 0）；JSON 解码时外层字段优先。
@@ -150,6 +225,9 @@ func Methods(d Deps) xrpc.Methods {
 				return nil, err
 			}
 			if p.Inbound == "" {
+				if _, err := d.checkHasKernel(); err != nil {
+					return nil, err
+				}
 				return xrpc.ConnectionsKicked{Kicked: d.Tracker.KickUser(p.Credential)}, nil
 			}
 			if err := d.checkInbound(p.Inbound); err != nil {
@@ -169,6 +247,25 @@ func Methods(d Deps) xrpc.Methods {
 			}
 			if at := d.Kernel.StartedAt(); !at.IsZero() {
 				out.KernelStartedAt = &at
+			}
+			return out, nil
+		},
+		xrpc.MethodKernelRestart: func(_ context.Context, _ json.RawMessage) (any, error) {
+			config, tags, err := ReadKernelConfig(d.ConfigDir)
+			if err != nil {
+				return nil, badParams("%v", err)
+			}
+			if err := d.Kernel.Restart(d.kernelCtx(), config); err != nil {
+				return nil, err
+			}
+			d.Inbounds.Set(tags)
+			out := xrpc.KernelRestarted{
+				Running:  d.Kernel.Running(),
+				Version:  kernel.Version,
+				Inbounds: tags,
+			}
+			if at := d.Kernel.StartedAt(); !at.IsZero() {
+				out.StartedAt = &at
 			}
 			return out, nil
 		},

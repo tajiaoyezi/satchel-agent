@@ -47,6 +47,25 @@ func (k *Kernel) Start(ctx context.Context, config []byte) error {
 	if k.instance != nil {
 		return ErrRunning
 	}
+	return k.startLocked(ctx, config)
+}
+
+// Restart 在同一把锁里先把正在跑的内核停掉（没在跑就直接起），再按新配置启动（m2-04 design 第 2 条，agent-kernel「重启内核」）。
+// ctx 已取消时不动正在跑的内核，直接返回错误；新配置起不来时内核停着，Running() 为 false，tracker 的内核代数不加。
+func (k *Kernel) Restart(ctx context.Context, config []byte) error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("内核启动期间被取消：%w", err)
+	}
+	_ = k.stopLocked()
+	return k.startLocked(ctx, config)
+}
+
+func (k *Kernel) startLocked(ctx context.Context, config []byte) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("内核启动期间被取消：%w", err)
+	}
 	boxCtx, cancel := context.WithCancel(include.Context(context.Background()))
 	options, err := json.UnmarshalExtendedContext[option.Options](boxCtx, config)
 	if err != nil {
@@ -108,6 +127,10 @@ const Version = "1.14.4"
 func (k *Kernel) Stop() error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	return k.stopLocked()
+}
+
+func (k *Kernel) stopLocked() error {
 	if k.instance == nil {
 		return nil
 	}

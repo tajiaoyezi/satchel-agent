@@ -2,7 +2,7 @@
 
 Satchel（百宝袋）的节点守护进程，装在每台被管理的服务器上，对应 mmwx 的 mmw-agent。内核是内嵌的 sing-box；与主控 `satchel` 的通信、配对、配置下发按技术方案第 06 章。
 
-**状态：M2「节点与内核」进行中：已有配对与通道（websocket 模式、心跳、在线状态）；`run` 照本地的 `kernel.json` 起内核，主控经通道临时限速、踢线、列连接、拉流量快照（m2-03）。**
+**状态：M2「节点与内核」进行中：已有配对与通道（websocket 模式、心跳、在线状态）；`run` 照本地的 `kernel.json` 起内核，主控经通道临时限速、踢线、列连接、拉流量快照、重启内核（m2-03、m2-04）。**
 
 与主控共用的代码（securechan、xrpc、资源类型）放在 `satchel` 仓库的 `pkg/` 下，本仓库以 Go module 依赖引用，不复制第二份（技术方案第 02 章）。go.mod 用 `replace github.com/satchel/satchel => ../satchel` 指向同级检出的主控仓库：本地把两个仓库放在同一个目录下；CI 与发布线把主控仓库检出在旁边，钉在仓库根 `.satchel-ref` 写的提交上，主控的 `pkg/` 变了就改这个文件。
 
@@ -24,7 +24,7 @@ satchel-agent run
 
 配置文件所在的目录（默认 `/etc/satchel-agent/`）里还有两个文件：
 
-- `kernel.json`：一份 sing-box 配置，由人或测试环境放进去（主控下发入站配置要等后面的入站管理）。有它 `run` 就照它起内核，没有就只连主控；它解析不了或内核起不来时只记日志、照常连主控。改了要重启 satchel-agent 才生效。主控命令里的入站名就是这里 `inbounds[].tag`，凭据名是入站里用户的 `name`。
+- `kernel.json`：一份 sing-box 配置，由人或测试环境放进去（主控下发入站配置要等后面的入站管理）。有它 `run` 就照它起内核，没有就只连主控；它解析不了或内核起不来时只记日志、照常连主控。改了以后在主控执行 `satchel server restart-kernel <名字> --confirm <名字>`（在同一个进程里重启内核，计数、限速与启动标识不丢）或重启 satchel-agent 生效。主控命令里的入站名就是这里 `inbounds[].tag`，凭据名是入站里用户的 `name`。
 - `limiter-state.json`：每份「入站 × 凭据」的三份限速来源（静态、主控临时、节点规则临时）与截止时间，由 agent 自己写（权限 0600），每次改动都写；`run` 启动时先把它重放进 tracker 再起内核，已过期的丢掉。主控失联时已下发的值照常生效、按自己的截止时间到期。
 
 截止时间是主控按自己的时钟算出的绝对时间，节点要开 NTP，否则到期会提前或推后。
@@ -49,7 +49,7 @@ go vet -tags with_quic ./...
 go test -tags with_quic ./...
 ```
 
-`internal/kernel` 里有 M2 证伪点的五项测试（按凭据限速、识别连接、踢线、三维计数、重启基线，测试名都以 `TestFalsification` 开头）。默认跑快速版：时间窗与数据量都缩小，只查行为对不对。结论以完整版为准，完整版多带一个标签 `falsification`：
+`internal/kernel` 里有 M2 证伪点的五项测试（按凭据限速、识别连接、踢线、三维计数、重启基线，测试名都以 `TestFalsification` 开头）；起停测试内核、客户端、收发流量服务与本地转发的工具放在 `pkg/kerneltest`，主控仓库 `test/acceptance` 的正式验收也引用它。默认跑快速版：时间窗与数据量都缩小，只查行为对不对。结论以完整版为准，完整版多带一个标签 `falsification`：
 
 ```sh
 go test -tags with_quic,falsification -run Falsification -timeout 30m -v ./...

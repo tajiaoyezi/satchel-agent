@@ -330,7 +330,7 @@ func TestControlMethodsOverChannel(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		methods := control.Methods(control.Deps{Limits: store, Tracker: tr, Kernel: kernel.New(tr), Inbounds: inbounds})
+		methods := control.Methods(control.Deps{Limits: store, Tracker: tr, Kernel: kernel.New(tr), Inbounds: control.NewInbounds(inbounds)})
 		runClient(t, Config{MasterURL: m.url(), Token: "tok", MasterKey: m.pub(), AgentVersion: "1.0.0", Methods: methods})
 		waitAuth(t, m)
 		return <-m.callers

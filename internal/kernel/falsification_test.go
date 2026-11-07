@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	kt "github.com/satchel/satchel-agent/internal/kernel/kerneltest"
 	"github.com/satchel/satchel-agent/internal/tracker"
+	kt "github.com/satchel/satchel-agent/pkg/kerneltest"
 )
 
 // M2 证伪点的五项（技术方案第 13 章，agent-kernel）。每项都有快速版与完整版（-tags falsification），数值口径照第 13 章，
@@ -128,7 +128,7 @@ func (c *clients) get(user, inbound string) *kt.Client {
 	}
 	key := user + "@" + inbound
 	if c.m[key] == nil {
-		c.m[key] = kt.StartClient(c.t, c.s, user, inbound)
+		c.m[key] = kt.StartClient(c.t, c.s.Target(), user, inbound)
 	}
 	return c.m[key]
 }
@@ -201,7 +201,7 @@ func TestFalsificationLimit(t *testing.T) {
 		settle(t, tr)
 		c := cl.get(kt.UserA, kt.InVLESS)
 		down := downloads(t, c, 2)
-		up := []*kt.Flow{kt.Upload(t, s, c, 1, "case4-1", 0, 0), kt.Upload(t, s, c, 1, "case4-2", 0, 0)}
+		up := []*kt.Flow{kt.Upload(t, s.Sink1, c, 1, "case4-1", 0, 0), kt.Upload(t, s.Sink1, c, 1, "case4-2", 0, 0)}
 		b := kt.Download(t, cl.get(kt.UserB, kt.InVLESS), 1, bLoad, 0)
 		defer stopAll(append(append(down, up...), b)...)
 		time.Sleep(prof.warmup)
@@ -313,9 +313,9 @@ func TestFalsificationConnections(t *testing.T) {
 			if in == kt.InHY2 {
 				network, target = "udp", s.HY2Port
 			}
-			r := kt.StartRelay(t, network, target)
+			r := kt.StartRelay(t, network, fmt.Sprintf("127.0.0.1:%d", target))
 			relays[user+"@"+in] = r
-			c := kt.StartClientVia(t, s, user, in, r.Port)
+			c := kt.StartClientVia(t, s.Target(), user, in, r.Port)
 			for i := 0; i < 3; i++ {
 				kt.Echo(t, c, sinkOf[user][0])
 			}
@@ -445,10 +445,10 @@ func TestFalsificationCounting(t *testing.T) {
 	t0 := time.Now()
 	flows := []*kt.Flow{
 		kt.Download(t, cl.get(kt.UserA, kt.InVLESS), 1, 0, 100*mb),
-		kt.Upload(t, s, cl.get(kt.UserA, kt.InVLESS), 2, "a-up", 0, 60*mb),
+		kt.Upload(t, s.Sink2, cl.get(kt.UserA, kt.InVLESS), 2, "a-up", 0, 60*mb),
 		kt.Download(t, cl.get(kt.UserA, kt.InHY2), 2, 0, 40*mb),
 		kt.Download(t, cl.get(kt.UserB, kt.InVLESS), 2, 0, 30*mb),
-		kt.Upload(t, s, cl.get(kt.UserB, kt.InHY2), 1, "b-up", 0, 20*mb),
+		kt.Upload(t, s.Sink1, cl.get(kt.UserB, kt.InHY2), 1, "b-up", 0, 20*mb),
 	}
 	waitDone(t, 5*time.Minute, flows...)
 	elapsed := time.Since(t0)

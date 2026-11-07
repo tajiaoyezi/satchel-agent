@@ -185,10 +185,14 @@ func TestStateConsistentWhenSourceExpires(t *testing.T) {
 	s, tr := open(t, filepath.Join(t.TempDir(), FileName), func() time.Time { return now })
 	deadline := start.Add(time.Minute)
 	ok(s.Set("vless-in", "a", xrpc.SourceMaster, 5*mbps, &deadline))
+	ok(s.Set("vless-in", "expired-user", xrpc.SourceMaster, 5*mbps, &deadline))
 	now = start.Add(2 * time.Minute) // 存储看来主控临时已经过期；tracker 按真实时间，一分钟内不会撤
 	st := ok(s.Set("vless-in", "a", xrpc.SourceStatic, 10*mbps, nil))
 	if len(st.Sources) != 1 || st.Sources[0].Source != xrpc.SourceStatic || st.EffectiveBPS != 10*mbps {
 		t.Fatalf("回复里不应当有已过期的主控临时，生效值应当是静态的 10 Mbps：%+v", st)
+	}
+	if len(s.entries) != 1 || len(s.entries[key{"vless-in", "a"}]) != 1 {
+		t.Fatalf("自然过期的条目与空键应当在下次改动时从内存里清掉：%+v", s.entries)
 	}
 	if bps, _ := tr.Effective("vless-in", "a"); bps != 5*mbps {
 		t.Fatalf("这个测试要的正是 tracker 还没撤的那一刻：%d", bps)

@@ -43,6 +43,14 @@ var uuids = map[string]string{UserA: "6a4f1c2e-3b5d-4e7f-8a9b-0c1d2e3f4a5b", Use
 
 func password(user string) string { return "pw-" + user }
 
+// Target 描述服务端入站与收发流量服务在哪（本机或容器网络里的另一台主机）。
+type Target struct {
+	Host               string
+	VLESSPort, HY2Port int
+	SinkHost           string
+	SinkPorts          [3]int // 下标 1、2：Sink1、Sink2 的端口
+}
+
 // Server 是服务端内核与两个收发流量的服务：发往 Sink1 的走 out1，发往 Sink2 的走 out2。
 type Server struct {
 	Kernel    *kernel.Kernel
@@ -101,10 +109,9 @@ func (s *Server) Tracker() *tracker.Tracker { return s.Kernel.Tracker() }
 // RestartKernel 在同一个进程里停掉再启动服务端内核，tracker 不变。
 func (s *Server) RestartKernel(t testing.TB) {
 	t.Helper()
-	if err := s.Kernel.Stop(); err != nil {
+	if err := s.Kernel.Restart(context.Background(), s.config); err != nil {
 		t.Fatal(err)
 	}
-	s.start(t)
 }
 
 // RestartProcess 模拟 satchel-agent 进程重启：停掉内核，换一个新的 tracker（新的启动标识、计数从零开始）再启动。
@@ -125,6 +132,14 @@ func (s *Server) SinkPort(n int) int {
 	return s.Sink1.Port
 }
 
+// Target 返回本机服务端的连接目标。
+func (s *Server) Target() Target {
+	return Target{
+		Host: "127.0.0.1", VLESSPort: s.VLESSPort, HY2Port: s.HY2Port,
+		SinkHost: "127.0.0.1", SinkPorts: [3]int{0, s.Sink1.Port, s.Sink2.Port},
+	}
+}
+
 // Client 是一个（用户，入站）的客户端内核：本地两个 direct 入站分别通到服务端那边的 Sink1 与 Sink2。
 type Client struct {
 	User    string
@@ -134,31 +149,36 @@ type Client struct {
 }
 
 // StartClient 为 user 经服务端的 inbound（InVLESS 或 InHY2）起一个客户端内核。t 结束时停掉。
-func StartClient(t testing.TB, s *Server, user, inbound string) *Client {
+func StartClient(t testing.TB, target Target, user, inbound string) *Client {
 	t.Helper()
-	port := s.VLESSPort
+	port := target.VLESSPort
 	if inbound == InHY2 {
-		port = s.HY2Port
+		port = target.HY2Port
 	}
-	return StartClientVia(t, s, user, inbound, port)
+	return startClient(t, target, user, inbound, target.Host, port)
 }
 
 // StartClientVia 同 StartClient，但连本机的 port 去找服务端的入站（例如挡在入站前面的 Relay）。
-func StartClientVia(t testing.TB, s *Server, user, inbound string, port int) *Client {
+func StartClientVia(t testing.TB, target Target, user, inbound string, port int) *Client {
+	t.Helper()
+	return startClient(t, target, user, inbound, "127.0.0.1", port)
+}
+
+func startClient(t testing.TB, target Target, user, inbound, serverHost string, port int) *Client {
 	t.Helper()
 	c := &Client{User: user, Inbound: inbound}
 	var inbounds []any
 	for n := 1; n <= 2; n++ {
 		c.ports[n] = FreePort(t)
 		inbounds = append(inbounds, map[string]any{"type": "direct", "tag": fmt.Sprintf("local%d", n),
-			"listen": "127.0.0.1", "listen_port": c.ports[n], "override_address": "127.0.0.1", "override_port": s.SinkPort(n)})
+			"listen": "127.0.0.1", "listen_port": c.ports[n], "override_address": target.SinkHost, "override_port": target.SinkPorts[n]})
 	}
 	var proxy map[string]any
 	switch inbound {
 	case InVLESS:
-		proxy = map[string]any{"type": "vless", "tag": "proxy", "server": "127.0.0.1", "server_port": port, "uuid": uuids[user]}
+		proxy = map[string]any{"type": "vless", "tag": "proxy", "server": serverHost, "server_port": port, "uuid": uuids[user]}
 	case InHY2:
-		proxy = map[string]any{"type": "hysteria2", "tag": "proxy", "server": "127.0.0.1", "server_port": port,
+		proxy = map[string]any{"type": "hysteria2", "tag": "proxy", "server": serverHost, "server_port": port,
 			"password": password(user), "up_mbps": hy2Mbps, "down_mbps": hy2Mbps,
 			"tls": map[string]any{"enabled": true, "server_name": "localhost", "insecure": true}}
 	default:
@@ -236,8 +256,8 @@ func Download(t testing.TB, c *Client, n int, bps, total int64) *Flow {
 	return f
 }
 
-// Upload 经客户端开一条 TCP 上传，按 bps 发（0 表示不控速），total 为 0 表示一直发。计数在服务端那边的收发流量服务上（id 区分）。
-func Upload(t testing.TB, s *Server, c *Client, n int, id string, bps, total int64) *Flow {
+// Upload 经客户端开一条 TCP 上传，按 bps 发（0 表示不控速），total 为 0 表示一直发。计数在收发流量服务 sink 上（id 区分）。
+func Upload(t testing.TB, sink *Sink, c *Client, n int, id string, bps, total int64) *Flow {
 	t.Helper()
 	conn, err := c.DialTCP(n)
 	if err != nil {
@@ -245,10 +265,6 @@ func Upload(t testing.TB, s *Server, c *Client, n int, id string, bps, total int
 	}
 	if _, err := fmt.Fprintf(conn, "U %s\n", id); err != nil {
 		t.Fatal(err)
-	}
-	sink := s.Sink1
-	if n == 2 {
-		sink = s.Sink2
 	}
 	f := &Flow{Meter: sink.Upload(id), conn: conn, done: make(chan struct{})}
 	go func() {

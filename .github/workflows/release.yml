@@ -73,12 +73,19 @@ jobs:
     runs-on: ubuntu-latest
     environment: release-signing
     steps:
+      - uses: actions/checkout@v7
+        with:
+          path: satchel-agent
+
+      - name: read pinned satchel commit
+        run: echo "SATCHEL_REF=$(tr -d '[:space:]' < satchel-agent/.satchel-ref)" >> "$GITHUB_ENV"
+
       - name: checkout satchel (signing tool lives there)
         uses: actions/checkout@v7
         with:
           repository: tajiaoyezi/satchel
-          # 钉住签名程序所在的 satchel 版本：私钥会交给这份代码，不能用会动的 main。改它要有意识（换成新的 satchel tag）。
-          ref: v0.0.1-alpha.1
+          # 钉住签名程序所在的 satchel 提交（与 build 同读 .satchel-ref）：私钥会交给这份代码，不能用会动的 main。
+          ref: ${{ env.SATCHEL_REF }}
           path: satchel
 
       - uses: actions/setup-go@v7

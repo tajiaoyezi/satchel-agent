@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/satchel/satchel-agent/internal/kernel"
-	kt "github.com/satchel/satchel-agent/internal/kernel/kerneltest"
 	"github.com/satchel/satchel-agent/internal/tracker"
+	kt "github.com/satchel/satchel-agent/pkg/kerneltest"
 )
 
 // agent-kernel「零 fork 内嵌 sing-box」「带标签能起 Hysteria2」：四个客户端（A、B 各经 VLESS 与 Hysteria2）的 TCP 与 UDP 都通。
@@ -24,27 +24,63 @@ func TestSmoke(t *testing.T) {
 	s := kt.StartServer(t)
 	for _, user := range []string{kt.UserA, kt.UserB} {
 		for _, in := range []string{kt.InVLESS, kt.InHY2} {
-			c := kt.StartClient(t, s, user, in)
+			c := kt.StartClient(t, s.Target(), user, in)
 			kt.Echo(t, c, 1)
 			kt.EchoUDP(t, c, 2)
 		}
 	}
 }
 
-// agent-kernel「内核起停」：同一进程里停掉再启动，客户端能重新连上，tracker 是同一个实例，内核代数为 2。
+// agent-kernel「内核起停」与「重启内核」：同一进程里 Restart，客户端能重新连上，tracker 是同一个实例，内核代数为 2、StartedAt 变新；
+// ctx 已取消时不动正在跑的内核；新配置起不来时内核停着、代数不加，换好的配置再 Restart 能起来。
 func TestKernelRestart(t *testing.T) {
 	s := kt.StartServer(t)
 	tr := s.Tracker()
-	c := kt.StartClient(t, s, kt.UserA, kt.InVLESS)
+	c := kt.StartClient(t, s.Target(), kt.UserA, kt.InVLESS)
 	kt.Echo(t, c, 1)
+	first := s.Kernel.StartedAt()
+	time.Sleep(10 * time.Millisecond)
 	s.RestartKernel(t)
-	if s.Tracker() != tr || tr.Generation() != 2 {
-		t.Fatalf("重启后 tracker 应当是同一个、内核代数为 2：%d", tr.Generation())
+	if s.Tracker() != tr || tr.Generation() != 2 || !s.Kernel.StartedAt().After(first) {
+		t.Fatalf("重启后 tracker 应当是同一个、内核代数为 2、StartedAt 变新：%d %v -> %v", tr.Generation(), first, s.Kernel.StartedAt())
 	}
 	kt.Echo(t, c, 1)
 	if err := s.Kernel.Start(context.Background(), []byte(`{}`)); err != kernel.ErrRunning {
 		t.Fatalf("在跑时再 Start 应当是 ErrRunning：%v", err)
 	}
+
+	// ctx 已取消时 Restart 不动原来的内核。
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.Kernel.Restart(canceled, []byte(`{}`)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ctx 已取消时 Restart 应当回 Canceled：%v", err)
+	}
+	if !s.Kernel.Running() || tr.Generation() != 2 {
+		t.Fatalf("ctx 已取消时原来的内核应当还在跑、代数不变：%v %d", s.Kernel.Running(), tr.Generation())
+	}
+	kt.Echo(t, c, 1)
+
+	// 能解析但起不来的配置（入站端口被占）：内核停着，Running() 为 false，代数不加；放开并换回好配置再 Restart 能起来。
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	badCfg := []byte(fmt.Sprintf(`{"log":{"disabled":true},"inbounds":[{"type":"direct","tag":"in","listen":"127.0.0.1",`+
+		`"listen_port":%d,"network":"tcp","override_address":"127.0.0.1","override_port":9}]}`, busy.Addr().(*net.TCPAddr).Port))
+	if err := s.Kernel.Restart(context.Background(), badCfg); err == nil {
+		t.Fatal("端口被占时 Restart 应当失败")
+	}
+	if s.Kernel.Running() || tr.Generation() != 2 {
+		t.Fatalf("Restart 失败后内核应当停着、代数不加：%v %d", s.Kernel.Running(), tr.Generation())
+	}
+	if err := s.Kernel.Restart(context.Background(), s.Config()); err != nil {
+		t.Fatalf("换回好配置后 Restart 应当成功：%v", err)
+	}
+	if !s.Kernel.Running() || tr.Generation() != 3 {
+		t.Fatalf("再起来后 Running 应当为 true、代数为 3：%v %d", s.Kernel.Running(), tr.Generation())
+	}
+	kt.Echo(t, c, 1)
 }
 
 // 半关闭照常：目标发完 hello 就半关闭，客户端读到 EOF 后还能接着上传，目标收得到。包装层不转发 CloseWrite 的话，
@@ -53,7 +89,7 @@ func TestKernelRestart(t *testing.T) {
 func TestHalfClose(t *testing.T) {
 	s := kt.StartServer(t)
 	for _, in := range []string{kt.InVLESS} {
-		c := kt.StartClient(t, s, kt.UserA, in)
+		c := kt.StartClient(t, s.Target(), kt.UserA, in)
 		conn, err := c.DialTCP(1)
 		if err != nil {
 			t.Fatal(err)
@@ -141,7 +177,7 @@ func TestHooksSeeAllPaths(t *testing.T) {
 	s := kt.StartServer(t)
 	tr := s.Tracker()
 	for _, in := range []string{kt.InVLESS, kt.InHY2} {
-		c := kt.StartClient(t, s, kt.UserA, in)
+		c := kt.StartClient(t, s.Target(), kt.UserA, in)
 		kt.Echo(t, c, 1)    // TCP → Sink1 → out1
 		kt.EchoUDP(t, c, 2) // UDP → Sink2 → out2
 		got := kt.WaitConns(t, tr, in, kt.UserA, 2, 3*time.Second)

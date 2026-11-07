@@ -3,13 +3,14 @@ package control_test
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/satchel/satchel/pkg/xrpc"
 
 	"github.com/satchel/satchel-agent/internal/control"
-	kt "github.com/satchel/satchel-agent/internal/kernel/kerneltest"
+	kt "github.com/satchel/satchel-agent/pkg/kerneltest"
 )
 
 // serve 按方法名调一次，返回结果；出错让测试失败。
@@ -28,9 +29,9 @@ func serve(t *testing.T, m xrpc.Methods, method string, params any) json.RawMess
 func TestConnectionsKickAndSnapshot(t *testing.T) {
 	s := kt.StartServer(t)
 	tr := s.Tracker()
-	m := control.Methods(control.Deps{Tracker: tr, Kernel: s.Kernel, Inbounds: []string{kt.InVLESS, kt.InHY2}})
-	vless := kt.StartClient(t, s, kt.UserA, kt.InVLESS)
-	hy2 := kt.StartClient(t, s, kt.UserA, kt.InHY2)
+	m := control.Methods(control.Deps{Tracker: tr, Kernel: s.Kernel, Inbounds: control.NewInbounds([]string{kt.InVLESS, kt.InHY2})})
+	vless := kt.StartClient(t, s.Target(), kt.UserA, kt.InVLESS)
+	hy2 := kt.StartClient(t, s.Target(), kt.UserA, kt.InHY2)
 	for range 3 {
 		kt.Echo(t, vless, 1)
 	}
@@ -75,7 +76,7 @@ func TestConnectionsKickAndSnapshot(t *testing.T) {
 
 	// 不给入站：A 在两个入站上的连接都断开，B 的不受影响。
 	kt.Echo(t, vless, 1)
-	kt.Echo(t, kt.StartClient(t, s, kt.UserB, kt.InVLESS), 1)
+	kt.Echo(t, kt.StartClient(t, s.Target(), kt.UserB, kt.InVLESS), 1)
 	kt.WaitConns(t, tr, kt.InVLESS, kt.UserA, 1, 5*time.Second)
 	kt.WaitConns(t, tr, kt.InVLESS, kt.UserB, 1, 5*time.Second)
 	kicked = xrpc.ConnectionsKicked{}
@@ -94,5 +95,12 @@ func TestConnectionsKickAndSnapshot(t *testing.T) {
 	json.Unmarshal(serve(t, m, xrpc.MethodTrafficSnapshot, nil), &snap)
 	if !snap.KernelRunning || snap.KernelVersion == "" || snap.KernelStartedAt == nil || snap.Generation != 1 || len(snap.Counts) == 0 {
 		t.Fatalf("快照应当报内核在跑、带版本与启动时间、有计数：%+v", snap)
+	}
+
+	// 没有内核配置时，不给入站踢线也应当回参数不合法。
+	noKernel := control.Methods(control.Deps{Tracker: tr, Kernel: s.Kernel})
+	raw, _ := json.Marshal(xrpc.ConnectionsKickParams{Credential: kt.UserA})
+	if r := noKernel.Serve(context.Background(), xrpc.Call{ID: "2", Method: xrpc.MethodConnectionsKick, Params: raw}); r.Error == nil || r.Error.Code != xrpc.CodeBadParams || !strings.Contains(r.Error.Message, "没有内核配置") {
+		t.Fatalf("没有内核配置时不给入站踢线应当回参数不合法：%+v", r.Error)
 	}
 }

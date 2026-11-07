@@ -13,9 +13,9 @@ import (
 
 	"github.com/satchel/satchel/pkg/xrpc"
 
-	kt "github.com/satchel/satchel-agent/internal/kernel/kerneltest"
 	"github.com/satchel/satchel-agent/internal/limits"
 	"github.com/satchel/satchel-agent/internal/tracker"
+	kt "github.com/satchel/satchel-agent/pkg/kerneltest"
 )
 
 // agent-kernel「run 按本地配置起内核」：没有 kernel.json 不起内核，坏了也不起、只记日志，startKernel 都照常返回。
@@ -28,8 +28,8 @@ func TestStartKernelWithoutUsableConfig(t *testing.T) {
 			}
 			var logs bytes.Buffer
 			deps, k := startKernel(context.Background(), dir, slog.New(slog.NewTextHandler(&logs, nil)))
-			if k.Running() || deps.Inbounds != nil || deps.Limits == nil {
-				t.Fatalf("不应当起内核、没有入站名、限速存储照常可用：%v %v", k.Running(), deps.Inbounds)
+			if k.Running() || deps.Inbounds.Get() != nil || deps.Limits == nil {
+				t.Fatalf("不应当起内核、没有入站名、限速存储照常可用：%v %v", k.Running(), deps.Inbounds.Get())
 			}
 			if content != "" && !strings.Contains(logs.String(), "解析不了") {
 				t.Fatalf("日志里应当有内核配置解析不了：%s", logs.String())
@@ -49,8 +49,8 @@ func TestStartKernelAcceptsComments(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, kernelConfig), append([]byte("// 测试用的内核配置\n"), config...), 0o600)
 	deps, k := startKernel(context.Background(), dir, slog.New(slog.DiscardHandler))
 	defer k.Stop()
-	if !k.Running() || !slices.Equal(deps.Inbounds, []string{kt.InVLESS, kt.InHY2}) {
-		t.Fatalf("带注释的配置应当照常起内核：%v %v", k.Running(), deps.Inbounds)
+	if !k.Running() || !slices.Equal(deps.Inbounds.Get(), []string{kt.InVLESS, kt.InHY2}) {
+		t.Fatalf("带注释的配置应当照常起内核：%v %v", k.Running(), deps.Inbounds.Get())
 	}
 }
 
@@ -73,10 +73,10 @@ func TestStartKernelReplaysLimitsFirst(t *testing.T) {
 	}
 	deps, k := startKernel(context.Background(), dir, slog.New(slog.DiscardHandler))
 	defer k.Stop()
-	if !k.Running() || !slices.Equal(deps.Inbounds, []string{kt.InVLESS, kt.InHY2}) {
-		t.Fatalf("应当照 kernel.json 起内核：%v %v", k.Running(), deps.Inbounds)
+	if !k.Running() || !slices.Equal(deps.Inbounds.Get(), []string{kt.InVLESS, kt.InHY2}) {
+		t.Fatalf("应当照 kernel.json 起内核：%v %v", k.Running(), deps.Inbounds.Get())
 	}
-	c := kt.StartClient(t, s, kt.UserA, kt.InVLESS)
+	c := kt.StartClient(t, s.Target(), kt.UserA, kt.InVLESS)
 	var flows []*kt.Flow
 	for range 4 {
 		flows = append(flows, kt.Download(t, c, 1, 0, 0))
