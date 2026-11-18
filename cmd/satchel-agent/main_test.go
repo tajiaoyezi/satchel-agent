@@ -69,11 +69,14 @@ func TestJoin(t *testing.T) {
 	}
 
 	bad := map[string][]string{
-		"缺主控公钥":   {"--master-url", "https://panel.example.com", "--token", "tok", "--mode", "websocket"},
-		"公钥不是公钥":  {"--master-url", "https://panel.example.com", "--token", "tok", "--master-key", "not-a-key", "--mode", "websocket"},
-		"http 地址": {"--master-url", "http://panel.example.com", "--token", "tok", "--master-key", key, "--mode", "websocket"},
-		"别的模式":    {"--master-url", "https://panel.example.com", "--token", "tok", "--master-key", key, "--mode", "auto"},
-		"缺 token": {"--master-url", "https://panel.example.com", "--master-key", key, "--mode", "websocket"},
+		"缺主控公钥":     {"--master-url", "https://panel.example.com", "--token", "tok", "--mode", "websocket"},
+		"公钥不是公钥":    {"--master-url", "https://panel.example.com", "--token", "tok", "--master-key", "not-a-key", "--mode", "websocket"},
+		"http 地址":   {"--master-url", "http://panel.example.com", "--token", "tok", "--master-key", key, "--mode", "websocket"},
+		"非法模式":      {"--master-url", "https://panel.example.com", "--token", "tok", "--master-key", key, "--mode", "bogus"},
+		"auto缺pull": {"--master-url", "https://panel.example.com", "--token", "tok", "--agent-token", "agt", "--master-key", key, "--mode", "auto"},
+		"端口冲突":      {"--master-url", "https://panel.example.com", "--token", "tok", "--agent-token", "agt", "--pull-token", "pul", "--listen-port", "23889", "--pull-port", "23889", "--master-key", key, "--mode", "auto"},
+		"控制字符注入":    {"--master-url", "https://panel.example.com", "--token", "tok\nevil: 1", "--master-key", key, "--mode", "websocket"},
+		"缺 token":   {"--master-url", "https://panel.example.com", "--master-key", key, "--mode", "websocket"},
 	}
 	for name, args := range bad {
 		t.Run(name, func(t *testing.T) {
@@ -89,6 +92,20 @@ func TestJoin(t *testing.T) {
 	}
 	if code := run(append([]string{"join"}, joinArgs(path, key)...), &out, &errOut); code != 0 {
 		t.Fatal("已存在的配置应当整份覆盖（重新配对）")
+	}
+
+	// 四模式完整参数写回 0600 验证。
+	autoPath := filepath.Join(t.TempDir(), "auto", "config.yaml")
+	autoArgs := []string{"join", "--master-url", "https://panel.example.com", "--token", "t1", "--agent-token", "t2", "--pull-token", "t3",
+		"--master-key", key, "--mode", "auto", "--listen-port", "24889", "--pull-port", "24890", "--config", autoPath}
+	if code := run(autoArgs, &out, &errOut); code != 0 {
+		t.Fatalf("join auto 应当成功：%d %s", code, errOut.String())
+	}
+	autoData, _ := os.ReadFile(autoPath)
+	for _, want := range []string{"agent_token: t2", "pull_token: t3", "connection_mode: auto", "listen_port: 24889", "pull_port: 24890"} {
+		if !strings.Contains(string(autoData), want) {
+			t.Fatalf("auto 配置缺少 %q：%s", want, autoData)
+		}
 	}
 }
 

@@ -11,30 +11,79 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/satchel/satchel/pkg/securechan"
+
+	"github.com/satchel/satchel-agent/internal/pathguard"
 )
 
 // DefaultPath 是配置文件的默认位置。
 const DefaultPath = "/etc/satchel-agent/config.yaml"
 
-// ModeWebsocket 是这一版唯一支持的连接模式。
-const ModeWebsocket = "websocket"
+// 四种连接模式与节点入站默认端口。
+const (
+	ModeAuto      = "auto"
+	ModeWebsocket = "websocket"
+	ModeHTTP      = "http"
+	ModePull      = "pull"
+
+	DefaultListenPort = 23889
+	DefaultPullPort   = 23890
+)
+
+// Modes 是允许的连接模式清单。
+var Modes = []string{ModeAuto, ModeWebsocket, ModeHTTP, ModePull}
+
+// ValidMode 报告 mode 是否受支持。
+func ValidMode(mode string) bool { return slices.Contains(Modes, mode) }
 
 // Config 是配置文件的内容。
 type Config struct {
 	MasterURL       string `yaml:"master_url"`
 	Token           string `yaml:"token"`
+	AgentToken      string `yaml:"agent_token,omitempty"`
+	PullToken       string `yaml:"pull_token,omitempty"`
 	MasterPublicKey string `yaml:"master_public_key"`
 	ConnectionMode  string `yaml:"connection_mode"`
+	ListenPort      int    `yaml:"listen_port,omitempty"`
+	PullPort        int    `yaml:"pull_port,omitempty"`
 }
 
-// Validate 校验四项：都要有；主控地址是 https；主控公钥能解析成 Ed25519 公钥；连接模式是 websocket。
-// 主控地址末尾的 / 去掉。
+// EffectiveListenPort 返回生效的管理监听端口（未配置时取默认 23889）。
+func (c Config) EffectiveListenPort() int {
+	if c.ListenPort > 0 {
+		return c.ListenPort
+	}
+	return DefaultListenPort
+}
+
+// EffectivePullPort 返回生效的只读轮询端口（未配置时取默认 23890）。
+func (c Config) EffectivePullPort() int {
+	if c.PullPort > 0 {
+		return c.PullPort
+	}
+	return DefaultPullPort
+}
+
+// Validate 校验配置项：防控制字符注入、主控 https 地址、Ed25519 公钥、连接模式、各模式所需令牌与端口合法性；
+// 并去掉主控地址末尾的 /。
 func (c *Config) Validate() error {
+	for field, val := range map[string]string{
+		"master_url":        c.MasterURL,
+		"token":             c.Token,
+		"agent_token":       c.AgentToken,
+		"pull_token":        c.PullToken,
+		"master_public_key": c.MasterPublicKey,
+		"connection_mode":   c.ConnectionMode,
+	} {
+		if err := pathguard.RejectControlChars(field, val); err != nil {
+			return err
+		}
+	}
 	c.MasterURL = strings.TrimRight(strings.TrimSpace(c.MasterURL), "/")
 	switch {
 	case c.MasterURL == "":
@@ -53,8 +102,23 @@ func (c *Config) Validate() error {
 	if _, err := securechan.ParsePublicKey(c.MasterPublicKey); err != nil {
 		return fmt.Errorf("主控公钥不合法：%w", err)
 	}
-	if c.ConnectionMode != ModeWebsocket {
-		return fmt.Errorf("连接模式 %q 这一版还不支持：只支持 websocket", c.ConnectionMode)
+	if !ValidMode(c.ConnectionMode) {
+		return fmt.Errorf("连接模式 %q 不支持：必须是 auto、websocket、http 或 pull 之一", c.ConnectionMode)
+	}
+	if c.ConnectionMode != ModeWebsocket && c.AgentToken == "" {
+		return fmt.Errorf("%s 模式缺少 --agent-token（agent_token）", c.ConnectionMode)
+	}
+	if (c.ConnectionMode == ModeAuto || c.ConnectionMode == ModePull) && c.PullToken == "" {
+		return fmt.Errorf("%s 模式缺少 --pull-token（pull_token）", c.ConnectionMode)
+	}
+	if c.ListenPort < 0 || c.ListenPort > 65535 {
+		return fmt.Errorf("listen_port 必须在 0..65535 之间，得到 %d", c.ListenPort)
+	}
+	if c.PullPort < 0 || c.PullPort > 65535 {
+		return fmt.Errorf("pull_port 必须在 0..65535 之间，得到 %d", c.PullPort)
+	}
+	if c.EffectiveListenPort() == c.EffectivePullPort() {
+		return fmt.Errorf("管理监听端口（%d）与只读轮询端口（%d）不能相同", c.EffectiveListenPort(), c.EffectivePullPort())
 	}
 	return nil
 }
@@ -90,6 +154,10 @@ func Save(path string, c Config) error {
 		return fmt.Errorf("写配置文件失败：%w", err)
 	}
 	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("写配置文件失败：%w", err)
+	}
+	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return fmt.Errorf("写配置文件失败：%w", err)
 	}

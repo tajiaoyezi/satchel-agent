@@ -28,12 +28,13 @@ import (
 const kernelConfig = control.KernelConfig
 
 const usage = `用法：
-  satchel-agent join --master-url <url> --token <token> --master-key <key> --mode <mode> [--config <path>]
+  satchel-agent join --master-url <url> --token <token> --master-key <key> --mode <mode>
+                     [--agent-token <token>] [--pull-token <token>] [--listen-port <port>] [--pull-port <port>] [--config <path>]
   satchel-agent run [--config <path>]
   satchel-agent --version
 
-  join   把主控地址、token、主控公钥与连接模式写进配置文件（默认 ` + config.DefaultPath + `，权限 0600）
-  run    按配置连主控并保持连接（装成服务时由 systemd 或 OpenRC 运行）；配置目录里有 kernel.json 就照它起内核
+  join   把主控地址、通信凭据、主控公钥、连接模式与入站端口写进配置文件（默认 ` + config.DefaultPath + `，权限 0600）
+  run    按配置连主控并按模式开放受保护端口；配置目录里有 kernel.json 就照它起内核
 
 安装命令从主控的 satchel server install-command 取，安装脚本会替你执行 join 并装好服务。`
 
@@ -82,9 +83,13 @@ func join(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	var c config.Config
 	fs.StringVar(&c.MasterURL, "master-url", "", "主控地址（https）")
-	fs.StringVar(&c.Token, "token", "", "这台服务器的 token")
+	fs.StringVar(&c.Token, "token", "", "这台服务器上行认证的 token")
+	fs.StringVar(&c.AgentToken, "agent-token", "", "主控访问节点管理口（--mode 非 websocket 时必填）")
+	fs.StringVar(&c.PullToken, "pull-token", "", "主控拉取节点只读轮询口（--mode 为 auto 或 pull 时必填）")
 	fs.StringVar(&c.MasterPublicKey, "master-key", "", "主控公钥（标准 base64）")
-	fs.StringVar(&c.ConnectionMode, "mode", "", "连接模式（这一版只支持 websocket）")
+	fs.StringVar(&c.ConnectionMode, "mode", "", "连接模式（auto、websocket、http 或 pull）")
+	fs.IntVar(&c.ListenPort, "listen-port", 0, "节点管理监听端口（0 表示按默认 23889）")
+	fs.IntVar(&c.PullPort, "pull-port", 0, "节点只读轮询端口（0 表示按默认 23890）")
 	path := fs.String("config", config.DefaultPath, "配置文件的位置")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -123,9 +128,22 @@ func serve(args []string, stderr io.Writer) int {
 	logger := slog.New(slog.NewTextHandler(stderr, nil))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
-	logger.Info("satchel-agent 启动", "version", buildinfo.Get().Version, "master", c.MasterURL)
-	return runAgent(ctx, filepath.Dir(*path), channel.Config{MasterURL: c.MasterURL, Token: c.Token, MasterKey: c.MasterKey(),
-		AgentVersion: buildinfo.Get().Version, Logger: logger}, logger)
+	logger.Info("satchel-agent 启动", "version", buildinfo.Get().Version, "master", c.MasterURL, "mode", c.ConnectionMode)
+	return runAgent(ctx, filepath.Dir(*path), channel.Config{
+		MasterURL:       c.MasterURL,
+		Token:           c.Token,
+		AgentToken:      c.AgentToken,
+		PullToken:       c.PullToken,
+		MasterKey:       c.MasterKey(),
+		Mode:            c.ConnectionMode,
+		ListenPort:      c.EffectiveListenPort(),
+		PullPort:        c.EffectivePullPort(),
+		ConfigPath:      *path,
+		IPProbeInterval: channel.DefaultIPProbeInterval,
+		IPProber:        channel.DefaultIPProber,
+		AgentVersion:    buildinfo.Get().Version,
+		Logger:          logger,
+	}, logger)
 }
 
 // runAgent 按配置目录起内核、给通道装上连接管控的方法、连主控，直到 ctx 结束；结束时先断通道（Run 返回时已断开）、
