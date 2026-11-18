@@ -33,6 +33,7 @@ type inboundPort struct {
 	masterKey  ed25519.PublicKey
 	tokensFn   func() []string
 	methods    xrpc.Methods
+	healthFn   func() xrpc.AgentHealth
 	nonces     *securechan.NonceWindow
 	sessions   *securechan.SessionCache
 	now        func() time.Time
@@ -42,7 +43,7 @@ type inboundPort struct {
 	handshakes map[string]pendingHandshake
 }
 
-func newInboundPort(role, mode string, masterKey ed25519.PublicKey, tokensFn func() []string, methods xrpc.Methods, now func() time.Time, onPostCall func(string, *xrpc.Error)) *inboundPort {
+func newInboundPort(role, mode string, masterKey ed25519.PublicKey, tokensFn func() []string, methods xrpc.Methods, healthFn func() xrpc.AgentHealth, now func() time.Time, onPostCall func(string, *xrpc.Error)) *inboundPort {
 	if now == nil {
 		now = time.Now
 	}
@@ -52,6 +53,7 @@ func newInboundPort(role, mode string, masterKey ed25519.PublicKey, tokensFn fun
 		masterKey:  masterKey,
 		tokensFn:   tokensFn,
 		methods:    methods,
+		healthFn:   healthFn,
 		nonces:     securechan.NewNonceWindow(securechan.DefaultNonceTTL, 4096, now),
 		sessions:   securechan.NewSessionCache(securechan.SessionCacheConfig{TTL: securechan.DefaultSessionTTL, Now: now}),
 		now:        now,
@@ -123,6 +125,10 @@ func (p *inboundPort) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if p.healthFn != nil {
+		_ = json.NewEncoder(w).Encode(p.healthFn())
+		return
+	}
 	_ = json.NewEncoder(w).Encode(xrpc.AgentHealth{Status: "ok", Mode: p.mode})
 }
 

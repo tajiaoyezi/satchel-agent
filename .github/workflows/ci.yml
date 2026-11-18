@@ -83,3 +83,78 @@ jobs:
 
       - name: go test (falsification)
         run: go test -tags with_quic,falsification -run Falsification -timeout 30m -v ./...
+
+  shell:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck >/dev/null
+          shellcheck --severity=error docker-entrypoint.sh
+          shellcheck docker-entrypoint.sh || true
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: satchel-agent
+
+      - name: read pinned satchel commit
+        run: echo "SATCHEL_REF=$(tr -d '[:space:]' < satchel-agent/.satchel-ref)" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: tajiaoyezi/satchel
+          ref: ${{ env.SATCHEL_REF }}
+          path: satchel
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: satchel-agent
+          build-contexts: satchel=satchel
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: satchel-agent:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: verify image binary, nginx and network guard
+        run: |
+          docker run --rm satchel-agent:ci --version | grep -q "satchel-agent 0.0.0-dev"
+          docker run --rm --entrypoint nginx satchel-agent:ci -v
+
+          set +e
+          bridge_out=$(docker run --rm satchel-agent:ci 2>&1)
+          bridge_rc=$?
+          set -e
+          [ "$bridge_rc" -ne 0 ] || { echo "::error::默认桥接启动应当被入口脚本拒绝"; exit 1; }
+          printf '%s' "$bridge_out" | grep -q -- '--network host' || { echo "::error::默认桥接报错缺少 --network host 提示：$bridge_out"; exit 1; }
+
+          # 验证环境变量自动 join、--network host 正常启动与 SIGTERM 退出码 0。
+          cid=$(docker run -d --network host \
+            -e SATCHEL_MASTER_URL=https://127.0.0.1:19999 \
+            -e SATCHEL_TOKEN=tok-ci \
+            -e SATCHEL_MASTER_KEY=Gp8PtBixDGF/pHfQM4LZ6mSJuE8cRJ2vJiTUYxrC7rI= \
+            -e SATCHEL_MODE=websocket \
+            satchel-agent:ci)
+          sleep 2
+          state=$(docker inspect --format '{{.State.Status}}' "$cid")
+          if [ "$state" != "running" ]; then
+            docker logs "$cid"
+            docker rm -f "$cid" >/dev/null || true
+            echo "::error::host 网络容器未保持运行状态：$state"
+            exit 1
+          fi
+          docker stop "$cid" >/dev/null
+          code=$(docker inspect --format '{{.State.ExitCode}}' "$cid")
+          logs=$(docker logs "$cid" 2>&1)
+          docker rm -f "$cid" >/dev/null || true
+          [ "$code" = "0" ] || { echo "::error::docker stop 退出码应当是 0，实际 $code；日志：$logs"; exit 1; }
+          printf '%s' "$logs" | grep -q 'satchel-agent 已停止' || { echo "::error::日志缺少优雅停止记录：$logs"; exit 1; }

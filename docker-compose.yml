@@ -1,0 +1,24 @@
+# Satchel 节点守护 Compose 模板（m2-09 node-lifecycle）。
+# 用法：挂载已配对的 ./config/config.yaml，或在首次空配置时填入 SATCHEL_MASTER_URL / SATCHEL_TOKEN / SATCHEL_MASTER_KEY 后执行 docker compose up -d。
+services:
+  satchel-agent:
+    image: ${SATCHEL_AGENT_IMAGE:-ghcr.io/tajiaoyezi/satchel-agent:latest}
+    container_name: satchel-agent
+    restart: unless-stopped
+    stop_grace_period: 20s
+    # 节点需要接管宿主代理入站与管理端口，默认要求 host 网络模式。
+    network_mode: host
+    environment:
+      - SATCHEL_MASTER_URL=${SATCHEL_MASTER_URL:-}
+      - SATCHEL_TOKEN=${SATCHEL_TOKEN:-}
+      - SATCHEL_MASTER_KEY=${SATCHEL_MASTER_KEY:-}
+      - SATCHEL_MODE=${SATCHEL_MODE:-auto}
+      - SATCHEL_AGENT_TOKEN=${SATCHEL_AGENT_TOKEN:-}
+      - SATCHEL_PULL_TOKEN=${SATCHEL_PULL_TOKEN:-}
+      - SATCHEL_LISTEN_PORT=${SATCHEL_LISTEN_PORT:-}
+      - SATCHEL_PULL_PORT=${SATCHEL_PULL_PORT:-}
+    volumes:
+      - ./config:/etc/satchel-agent
+      - ./data:/var/lib/satchel-agent
+      # 若宿主缺少 /etc/localtime，请先配置宿主时区或移除这一行，避免被创建为空目录。
+      - /etc/localtime:/etc/localtime:ro

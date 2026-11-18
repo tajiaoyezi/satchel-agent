@@ -12,8 +12,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/satchel/satchel/pkg/release"
 
 	"github.com/satchel/satchel-agent/internal/buildinfo"
 	"github.com/satchel/satchel-agent/internal/channel"
@@ -22,6 +26,7 @@ import (
 	"github.com/satchel/satchel-agent/internal/kernel"
 	"github.com/satchel/satchel-agent/internal/limits"
 	"github.com/satchel/satchel-agent/internal/tracker"
+	"github.com/satchel/satchel-agent/internal/updater"
 )
 
 // kernelConfig 是内核配置（一份 sing-box 配置）的文件名，与 config.yaml 放在同一个目录；改了执行 server restart-kernel 或重启 satchel-agent 生效。
@@ -31,12 +36,18 @@ const usage = `用法：
   satchel-agent join --master-url <url> --token <token> --master-key <key> --mode <mode>
                      [--agent-token <token>] [--pull-token <token>] [--listen-port <port>] [--pull-port <port>] [--config <path>]
   satchel-agent run [--config <path>]
+  satchel-agent update [<version>] [--channel stable|prerelease] [--yes]
+  satchel-agent uninstall [--yes] [--detach-delay <duration>]
   satchel-agent --version
 
-  join   把主控地址、通信凭据、主控公钥、连接模式与入站端口写进配置文件（默认 ` + config.DefaultPath + `，权限 0600）
-  run    按配置连主控并按模式开放受保护端口；配置目录里有 kernel.json 就照它起内核
+  join       把主控地址、通信凭据、主控公钥、连接模式与入站端口写进配置文件（默认 ` + config.DefaultPath + `，权限 0600）
+  run        按配置连主控并按模式开放受保护端口；配置目录里有 kernel.json 就照它起内核
+  update     纯 Go 下载验签、试跑并替换自身二进制（容器内禁用）
+  uninstall  纯 Go 停止服务并清理二进制与白名单目录（容器内禁用）
 
 安装命令从主控的 satchel server install-command 取，安装脚本会替你执行 join 并装好服务。`
+
+var execSelf = syscall.Exec
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -49,6 +60,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return join(args[1:], stdout, stderr)
 		case "run":
 			return serve(args[1:], stderr)
+		case "update":
+			return cmdUpdate(args[1:], stdout, stderr)
+		case "uninstall":
+			return cmdUninstall(args[1:], stdout, stderr)
+		case "__verify":
+			return cmdVerify(args[1:], stdout, stderr)
 		}
 	}
 	fs := flag.NewFlagSet("satchel-agent", flag.ContinueOnError)
@@ -146,14 +163,36 @@ func serve(args []string, stderr io.Writer) int {
 	}, logger)
 }
 
-// runAgent 按配置目录起内核、给通道装上连接管控的方法、连主控，直到 ctx 结束；结束时先断通道（Run 返回时已断开）、
-// 先取消内核启动用的 ctx、再停内核。返回退出码。serve 只负责读配置与接信号。
+// runAgent 按配置目录起内核、给通道装上连接管控的方法、连主控，直到 ctx 结束或收到升级原地重启/卸载退出请求；
+// 结束时先断通道、先取消内核启动用的 ctx、再停内核，最后如收到 RequestExec 则原地 syscall.Exec 新二进制。
 func runAgent(ctx context.Context, dir string, cfg channel.Config, logger *slog.Logger) int {
-	kernelCtx, cancelKernel := context.WithCancel(ctx)
+	runCtx, stopRun := context.WithCancel(ctx)
+	defer stopRun()
+
+	var (
+		execMu   sync.Mutex
+		execPath string
+	)
+	if cfg.Execs == nil {
+		cfg.Execs = &updater.ExecCounter{}
+	}
+	if cfg.RequestExec == nil {
+		cfg.RequestExec = func(path string) {
+			execMu.Lock()
+			execPath = path
+			execMu.Unlock()
+			stopRun()
+		}
+	}
+	if cfg.RequestStop == nil {
+		cfg.RequestStop = stopRun
+	}
+
+	kernelCtx, cancelKernel := context.WithCancel(runCtx)
 	defer cancelKernel()
 	deps, k := startKernel(kernelCtx, dir, logger)
 	cfg.Methods = control.Methods(deps)
-	err := channel.New(cfg).Run(ctx)
+	err := channel.New(cfg).Run(runCtx)
 	cancelKernel()
 	logger.Info("已断开主控，停内核")
 	if serr := k.Stop(); serr != nil {
@@ -163,7 +202,125 @@ func runAgent(ctx context.Context, dir string, cfg channel.Config, logger *slog.
 		logger.Error("satchel-agent 异常退出", "err", err)
 		return 1
 	}
+
+	execMu.Lock()
+	targetExec := execPath
+	execMu.Unlock()
+	if targetExec != "" {
+		logger.Info("正在原地 exec 切换到新版本", "executable", targetExec)
+		if exErr := execSelf(targetExec, os.Args, os.Environ()); exErr != nil {
+			logger.Error("原地 exec 新版本失败，退出等待服务管理器重启", "executable", targetExec, "err", exErr)
+			return 1
+		}
+		return 0
+	}
+
 	logger.Info("satchel-agent 已停止")
+	return 0
+}
+
+var (
+	updaterApplyFn = updater.Apply
+	uninstallFn    = updater.RunUninstall
+)
+
+func reorderUpdateFlags(args []string) []string {
+	var flags, pos []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			pos = append(pos, a)
+			continue
+		}
+		flags = append(flags, a)
+		if !strings.Contains(a, "=") && (a == "--channel" || a == "-channel") && i+1 < len(args) {
+			i++
+			flags = append(flags, args[i])
+		}
+	}
+	return append(flags, pos...)
+}
+
+func cmdUpdate(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("satchel-agent update", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	ch := fs.String("channel", release.ChannelStable, "更新渠道（stable 或 prerelease）")
+	yes := fs.Bool("yes", false, "确认执行自更新")
+	noCDN := fs.Bool("no-cdn", false, "禁用更新 CDN，直连 GitHub / gh-proxy")
+	if err := fs.Parse(reorderUpdateFlags(args)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() > 1 {
+		fmt.Fprintf(stderr, "update 最多只收 1 个版本号参数：%v\n", fs.Args())
+		return 2
+	}
+	if !*yes {
+		fmt.Fprintln(stderr, "执行自更新需显式传递 --yes")
+		return 2
+	}
+	targetVer := ""
+	if fs.NArg() == 1 {
+		targetVer = strings.TrimSpace(fs.Arg(0))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	res, err := updaterApplyFn(ctx, updater.Options{
+		CurrentVersion: buildinfo.Get().Version,
+		TargetVersion:  targetVer,
+		Channel:        *ch,
+		UseCDN:         !*noCDN,
+	})
+	if err != nil {
+		fmt.Fprintln(stderr, "更新失败：", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "已从 %s 升级到 %s（来源 %s）；如以系统服务运行，请重启服务或由远程控制面原地接管\n",
+		res.PreviousVersion, res.TargetVersion, res.Source)
+	return 0
+}
+
+func cmdUninstall(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("satchel-agent uninstall", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	yes := fs.Bool("yes", false, "确认卸载并清理白名单文件与目录")
+	delay := fs.Duration("detach-delay", 0, "开始清理前的等待时间（脱离父进程组时用）")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "uninstall 不接受位置参数：%v\n", fs.Args())
+		return 2
+	}
+	if !*yes {
+		fmt.Fprintln(stderr, "执行卸载需显式传递 --yes")
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := uninstallFn(ctx, updater.UninstallOptions{Delay: *delay}); err != nil {
+		fmt.Fprintln(stderr, "卸载失败：", err)
+		return 1
+	}
+	fmt.Fprintln(stdout, "satchel-agent 已卸载清理完成")
+	return 0
+}
+
+func cmdVerify(args []string, stdout, stderr io.Writer) int {
+	if len(args) != 2 {
+		fmt.Fprintln(stderr, "用法：satchel-agent __verify <file> <sig>")
+		return 2
+	}
+	if err := release.VerifyFile(args[0], args[1]); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	fmt.Fprintln(stdout, "ok")
 	return 0
 }
 

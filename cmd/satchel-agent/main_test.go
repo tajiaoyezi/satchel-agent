@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"os"
@@ -9,7 +10,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/satchel/satchel/pkg/release"
 	"github.com/satchel/satchel/pkg/securechan"
+
+	"github.com/satchel/satchel-agent/internal/updater"
 )
 
 func TestVersionFlag(t *testing.T) {
@@ -118,5 +122,56 @@ func TestRunRefusesWithoutMasterKey(t *testing.T) {
 	var out, errOut bytes.Buffer
 	if code := run([]string{"run", "--config", path}, &out, &errOut); code != 1 || !strings.Contains(errOut.String(), "主控公钥") {
 		t.Fatalf("缺主控公钥应当拒绝启动：%d %s", code, errOut.String())
+	}
+}
+
+func TestUpdateUninstallAndVerifySubcommands(t *testing.T) {
+	// 1. update / uninstall 缺少 --yes 返回退出码 2。
+	var out, errOut bytes.Buffer
+	if code := run([]string{"update"}, &out, &errOut); code != 2 {
+		t.Fatalf("update 缺 --yes 应当退出码 2，得到 %d", code)
+	}
+	if code := run([]string{"uninstall"}, &out, &errOut); code != 2 {
+		t.Fatalf("uninstall 缺 --yes 应当退出码 2，得到 %d", code)
+	}
+
+	// 2. update 允许位置参数在 --yes 前后（flag 重排），并透传 Options。
+	origApply := updaterApplyFn
+	t.Cleanup(func() { updaterApplyFn = origApply })
+	var gotTarget, gotChannel string
+	var gotCDN bool
+	updaterApplyFn = func(_ context.Context, opts updater.Options) (*updater.Result, error) {
+		gotTarget, gotChannel, gotCDN = opts.TargetVersion, opts.Channel, opts.UseCDN
+		return &updater.Result{PreviousVersion: "0.1.0", TargetVersion: "0.2.0", Source: "cdn"}, nil
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := run([]string{"update", "0.2.0", "--channel", "prerelease", "--yes"}, &out, &errOut); code != 0 {
+		t.Fatalf("update 应当成功：%d %s", code, errOut.String())
+	}
+	if gotTarget != "0.2.0" || gotChannel != "prerelease" || !gotCDN || !strings.Contains(out.String(), "0.2.0") {
+		t.Fatalf("update 传参或输出不对：target=%q ch=%q cdn=%v out=%q", gotTarget, gotChannel, gotCDN, out.String())
+	}
+
+	// 3. __verify 通过包级 release.PublicKeys 验证分离签名，错误签名返 1。
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	origKeys := release.PublicKeys
+	t.Cleanup(func() { release.PublicKeys = origKeys })
+	release.PublicKeys = []string{securechan.EncodePublicKey(pub)}
+
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	sig := filepath.Join(dir, "bin.sig")
+	payload := []byte("hello-satchel-agent")
+	_ = os.WriteFile(bin, payload, 0o600)
+	_ = os.WriteFile(sig, ed25519.Sign(priv, payload), 0o600)
+	out.Reset()
+	errOut.Reset()
+	if code := run([]string{"__verify", bin, sig}, &out, &errOut); code != 0 || strings.TrimSpace(out.String()) != "ok" {
+		t.Fatalf("__verify 正常签名应当返回 0 ok：%d %s %s", code, out.String(), errOut.String())
+	}
+	_ = os.WriteFile(sig, ed25519.Sign(priv, []byte("tampered")), 0o600)
+	if code := run([]string{"__verify", bin, sig}, &out, &errOut); code != 1 {
+		t.Fatalf("__verify 篡改签名应当返回 1：%d", code)
 	}
 }

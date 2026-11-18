@@ -161,3 +161,235 @@ jobs:
           files: |
             release/satchel-agent-*
             release/checksums.txt
+
+  docker:
+    name: docker image
+    # 等待签名批准后统一对外发版：镜像与 Release 共用同一个版本三元组，并通过命名上下文引用 .satchel-ref 钉住的 satchel pkg/。
+    needs: sign
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: satchel-agent
+
+      - name: read pinned satchel commit
+        run: echo "SATCHEL_REF=$(tr -d '[:space:]' < satchel-agent/.satchel-ref)" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: tajiaoyezi/satchel
+          ref: ${{ env.SATCHEL_REF }}
+          path: satchel
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/satchel-agent
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, '-') }}
+            type=semver,pattern={{major}},enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=beta,enable=${{ contains(github.ref_name, '-') }}
+
+      - name: build args (same version triple as the binaries)
+        id: args
+        run: |
+          {
+            echo "version=${GITHUB_REF_NAME#v}"
+            echo "commit=$(git -C satchel-agent rev-parse --short=12 HEAD)"
+            echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: satchel-agent
+          build-contexts: satchel=satchel
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.args.outputs.version }}
+            COMMIT=${{ steps.args.outputs.commit }}
+            DATE=${{ steps.args.outputs.date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  publish-cdn:
+    name: update CDN (binaries)
+    # 仅在变量 UPDATE_CDN_ARMED=1 时推送 R2；先从已建 Release 拉取全部二进制与 .sig 写入 immutable 路径，确保 CDN 与 Release 逐字节一致。
+    needs: release
+    if: vars.UPDATE_CDN_ARMED == '1'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      AWS_DEFAULT_REGION: auto
+    steps:
+      - name: check R2 secrets
+        run: |
+          missing=""
+          [ -n "$R2_ACCOUNT_ID" ] || missing="$missing R2_ACCOUNT_ID"
+          [ -n "$AWS_ACCESS_KEY_ID" ] || missing="$missing R2_ACCESS_KEY_ID"
+          [ -n "$AWS_SECRET_ACCESS_KEY" ] || missing="$missing R2_SECRET_ACCESS_KEY"
+          [ -n "$R2_BUCKET" ] || missing="$missing R2_BUCKET"
+          if [ -n "$missing" ]; then
+            echo "::error::UPDATE_CDN_ARMED=1 但缺 secret：$missing"
+            exit 1
+          fi
+
+      - name: download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir dist
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern 'satchel-agent-*' --dir dist
+          ls -la dist
+
+      - name: push binaries and signatures to R2
+        run: |
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          version="${GITHUB_REF_NAME#v}"
+          for f in dist/satchel-agent-*; do
+            aws s3 cp "$f" "s3://${R2_BUCKET}/satchel-agent/releases/${version}/$(basename "$f")" --endpoint-url "$endpoint" \
+              --content-type application/octet-stream --cache-control "public, max-age=31536000, immutable"
+          done
+          echo "已推到 R2：satchel-agent/releases/${version}"
+
+  publish-cdn-index:
+    name: update CDN (channel index)
+    # 二进制与签名全量落盘后才按渠道串行切 version.json，保证版本单调不倒退。
+    needs: publish-cdn
+    concurrency:
+      group: publish-agent-cdn-index-${{ contains(github.ref_name, '-') && 'prerelease' || 'stable' }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      AWS_DEFAULT_REGION: auto
+    steps:
+      - name: build version.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json tagName,body,url,isPrerelease > rel.json
+          python3 - <<'PY'
+          import json, re
+
+          with open("rel.json", "r", encoding="utf-8") as f:
+              rel = json.load(f)
+          body = rel.get("body") or ""
+          ctrl_proto = 1
+          min_master = ""
+          m = re.search(r"<!--\s*satchel-meta:(.*?)-->", body, re.S)
+          if m:
+              try:
+                  meta = json.loads(m.group(1).strip())
+                  if isinstance(meta.get("control_protocol"), int) and meta["control_protocol"] > 0:
+                      ctrl_proto = meta["control_protocol"]
+                  if isinstance(meta.get("min_master_version"), str):
+                      min_master = meta["min_master_version"].strip()
+              except Exception:
+                  pass
+          out = {
+              "version": rel["tagName"],
+              "tag": rel["tagName"],
+              "notes": body,
+              "html_url": rel["url"],
+              "prerelease": bool(rel["isPrerelease"]),
+              "control_protocol": ctrl_proto,
+          }
+          if min_master:
+              out["min_master_version"] = min_master
+          with open("version.json", "w", encoding="utf-8") as f:
+              json.dump(out, f, ensure_ascii=False, indent=2)
+              f.write("\n")
+          PY
+          cat version.json
+
+      - name: update channel index
+        run: |
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          channel=stable
+          case "$GITHUB_REF_NAME" in *-*) channel=prerelease ;; esac
+          index="s3://${R2_BUCKET}/satchel-agent/channels/${channel}/version.json"
+          cat > semver_decide.py <<'PY'
+          import re, sys
+          SEMVER = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$")
+          def parse(v):
+              m = SEMVER.match(v or "")
+              if not m:
+                  return None
+              ids = None
+              if m.group(4) is not None:
+                  ids = []
+                  for p in m.group(4).split("."):
+                      if p == "":
+                          return None
+                      ids.append((0, int(p), "") if p.isdigit() else (1, 0, p))
+              return (int(m.group(1)), int(m.group(2)), int(m.group(3))), ids
+          def older(a, b):
+              if a[0] != b[0]:
+                  return a[0] < b[0]
+              if a[1] is None or b[1] is None:
+                  return a[1] is not None and b[1] is None
+              return a[1] < b[1]
+          new = parse(sys.argv[1])
+          missing = sys.argv[2] == "--missing"
+          cur = None if missing else parse(sys.argv[2])
+          if new is None:
+              print("INVALID_NEW")
+          elif missing:
+              print("WRITE")
+          elif cur is None:
+              print("BROKEN_CURRENT")
+          else:
+              print("SKIP" if older(new, cur) else "WRITE")
+          PY
+          if out="$(aws s3 cp "$index" current.json --endpoint-url "$endpoint" 2>&1)"; then
+            current="$(jq -r '.version // ""' current.json 2>/dev/null || true)"
+            decision="$(python3 semver_decide.py "$GITHUB_REF_NAME" "$current")"
+          elif printf '%s' "$out" | grep -qE '\(404\)|NoSuchKey|Not Found|does not exist'; then
+            echo "渠道 ${channel} 还没有索引：第一次发布"
+            current=""
+            decision="$(python3 semver_decide.py "$GITHUB_REF_NAME" --missing)"
+          else
+            echo "::error::读渠道 ${channel} 的当前索引失败，不覆盖：$out"
+            exit 1
+          fi
+          case "$decision" in
+            SKIP)
+              echo "渠道 ${channel} 的索引已经是 ${current}，比 ${GITHUB_REF_NAME} 新，不覆盖"
+              exit 0 ;;
+            INVALID_NEW)
+              echo "::error::tag ${GITHUB_REF_NAME} 不是合法的语义化版本，不写渠道索引"
+              exit 1 ;;
+            BROKEN_CURRENT)
+              echo "::warning::渠道 ${channel} 的索引里的版本号（${current}）解析不了，覆盖它" ;;
+          esac
+          aws s3 cp version.json "$index" --endpoint-url "$endpoint" \
+            --content-type application/json --cache-control "public, max-age=60"
+          echo "渠道 ${channel} 的索引已换成 ${GITHUB_REF_NAME}"

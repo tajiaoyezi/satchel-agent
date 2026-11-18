@@ -21,9 +21,8 @@ import (
 // 先调用 POST /api/remote/handshake 交换临时公钥并校验主控双向签名，再经 POST /api/remote/rpc 发送二进制加密信封；
 // 严禁携带 HTTP Authorization 请求头，遇到 412 自动清空本地会话重新握手并重试一次。
 type httpUplink struct {
-	c       *Client
-	baseURL string
-	client  *http.Client
+	c      *Client
+	client *http.Client
 
 	mu   sync.Mutex
 	sid  string
@@ -36,9 +35,8 @@ func newHTTPUplink(c *Client) *httpUplink {
 		cli = &http.Client{Timeout: handshakeTimeout}
 	}
 	return &httpUplink{
-		c:       c,
-		baseURL: strings.TrimRight(c.cfg.MasterURL, "/"),
-		client:  cli,
+		c:      c,
+		client: cli,
 	}
 }
 
@@ -72,7 +70,7 @@ func (u *httpUplink) handshake(ctx context.Context) (string, *securechan.Session
 	if err != nil {
 		return "", nil, err
 	}
-	req, err := http.NewRequestWithContext(hctx, http.MethodPost, u.baseURL+xrpc.HTTPMasterPathHandshake, bytes.NewReader(reqBytes))
+	req, err := http.NewRequestWithContext(hctx, http.MethodPost, u.c.getMasterURL()+xrpc.HTTPMasterPathHandshake, bytes.NewReader(reqBytes))
 	if err != nil {
 		return "", nil, err
 	}
@@ -127,12 +125,16 @@ func (u *httpUplink) Call(ctx context.Context, method string, hb *xrpc.HTTPHeart
 		if err != nil {
 			return nil, err
 		}
+		info := u.c.runtimeInfo()
 		payload := xrpc.AgentHTTPRPC{
 			Method:           method,
 			Token:            u.c.creds.Token(),
-			AgentVersion:     u.c.cfg.AgentVersion,
+			AgentVersion:     info.AgentVersion,
 			ControlProtocol:  xrpc.ControlProtocol,
 			MinMasterVersion: MinMasterVersion,
+			InDocker:         info.InDocker,
+			MachineID:        info.MachineID,
+			MasterURL:        info.MasterURL,
 			Heartbeat:        hb,
 			Traffic:          snap,
 		}
@@ -145,7 +147,7 @@ func (u *httpUplink) Call(ctx context.Context, method string, hb *xrpc.HTTPHeart
 			return nil, err
 		}
 		rctx, cancel := context.WithTimeout(ctx, writeTimeout)
-		req, err := http.NewRequestWithContext(rctx, http.MethodPost, u.baseURL+xrpc.HTTPMasterPathRPC, bytes.NewReader(env))
+		req, err := http.NewRequestWithContext(rctx, http.MethodPost, u.c.getMasterURL()+xrpc.HTTPMasterPathRPC, bytes.NewReader(env))
 		if err != nil {
 			cancel()
 			return nil, err

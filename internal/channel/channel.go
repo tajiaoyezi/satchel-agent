@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,11 +18,12 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/satchel/satchel/pkg/securechan"
+	"github.com/satchel/satchel/pkg/release"
 	"github.com/satchel/satchel/pkg/xrpc"
 
 	"github.com/satchel/satchel-agent/internal/config"
 	"github.com/satchel/satchel-agent/internal/pathguard"
+	"github.com/satchel/satchel-agent/internal/updater"
 )
 
 // MinMasterVersion 是这个 agent 要求的最低主控版本：线格式第一次出现不兼容的变化时填上；空表示不要求。
@@ -87,6 +87,15 @@ type Config struct {
 	Now                   func() time.Time
 	HTTPClient            *http.Client
 	SaveConfig            func(config.Config) error
+	Execs                 *updater.ExecCounter
+	RequestExec           func(exePath string)
+	RequestStop           func()
+	Root                  string
+	MachineID             string
+	StagingDir            string
+	ReleaseSources        release.Sources
+	UpdateApply           func(context.Context, updater.Options) (*updater.Result, error)
+	UninstallSpawn        func(context.Context, updater.DetachOptions) (string, error)
 }
 
 // AuthError 是主控拒绝了认证（或握手时主控公钥对不上）。
@@ -107,6 +116,9 @@ func (e *AuthError) Error() string {
 // Client 是节点的通道。
 type Client struct {
 	cfg        Config
+	root       string
+	machineID  string
+	inDocker   bool
 	boot       time.Time
 	creds      *credStore
 	methods    xrpc.Methods
@@ -115,9 +127,16 @@ type Client struct {
 	gate       *listenGate
 	uplink     *httpUplink
 
+	masterMu sync.RWMutex
+	master   string
+
+	wsMu     sync.Mutex
+	wsCancel context.CancelFunc
+
 	rotateMu     sync.Mutex
 	cleanupMu    sync.Mutex
 	pendingRoles []string
+	postActions  []func()
 
 	wakeupCh chan struct{}
 	wsWakeCh chan struct{}
@@ -162,6 +181,14 @@ func New(cfg Config) *Client {
 	if cfg.IPProber != nil && cfg.IPProbeInterval == 0 {
 		cfg.IPProbeInterval = DefaultIPProbeInterval
 	}
+	root := strings.TrimSpace(cfg.Root)
+	if root == "" {
+		root = "/"
+	}
+	machineID := strings.TrimSpace(cfg.MachineID)
+	if machineID == "" {
+		machineID = readAgentMachineID(root)
+	}
 	listenPort := cfg.ListenPort
 	if listenPort == 0 && cfg.Mode != config.ModeWebsocket {
 		listenPort = config.DefaultListenPort
@@ -172,26 +199,35 @@ func New(cfg Config) *Client {
 	}
 
 	c := &Client{
-		cfg:      cfg,
-		boot:     time.Now().UTC(),
-		creds:    newCredStore(cfg.Token, cfg.AgentToken, cfg.PullToken),
-		wakeupCh: make(chan struct{}, 1),
-		wsWakeCh: make(chan struct{}, 1),
+		cfg:       cfg,
+		root:      root,
+		machineID: machineID,
+		inDocker:  release.InDocker(root),
+		master:    strings.TrimRight(strings.TrimSpace(cfg.MasterURL), "/"),
+		boot:      time.Now().UTC(),
+		creds:     newCredStore(cfg.Token, cfg.AgentToken, cfg.PullToken),
+		wakeupCh:  make(chan struct{}, 1),
+		wsWakeCh:  make(chan struct{}, 1),
 	}
 
 	baseMethods := xrpc.Methods{
 		xrpc.MethodAgentInfo: func(context.Context, json.RawMessage) (any, error) {
-			return xrpc.AgentInfo{AgentVersion: cfg.AgentVersion, ControlProtocol: xrpc.ControlProtocol}, nil
+			return c.runtimeInfo(), nil
 		},
 		xrpc.MethodAgentHealth: func(context.Context, json.RawMessage) (any, error) {
-			return xrpc.AgentHealth{Status: "ok", Mode: cfg.Mode}, nil
+			return c.runtimeHealth(), nil
 		},
 	}
 	maps.Copy(baseMethods, cfg.Methods)
 	baseMethods[xrpc.MethodTokenRotate] = c.handleTokenRotate
+	baseMethods[xrpc.MethodAgentUpdate] = c.handleAgentUpdate
+	baseMethods[xrpc.MethodAgentUninstall] = c.handleAgentUninstall
+	baseMethods[xrpc.MethodAgentSwitchPorts] = c.handleAgentSwitchPorts
+	baseMethods[xrpc.MethodAgentProbeMaster] = c.handleAgentProbeMaster
+	baseMethods[xrpc.MethodAgentUpdateMaster] = c.handleAgentUpdateMaster
 	c.methods = baseMethods
 
-	// 只读轮询口仅暴露 traffic.snapshot 与 agent.health，绝不挂载任何管理写动作。
+	// 只读轮询口仅暴露 traffic.snapshot 与 agent.health，绝不挂载任何管理写或生命周期控制动作。
 	pullMethods := xrpc.Methods{
 		xrpc.MethodAgentHealth: baseMethods[xrpc.MethodAgentHealth],
 	}
@@ -199,14 +235,14 @@ func New(cfg Config) *Client {
 		pullMethods[xrpc.MethodTrafficSnapshot] = snapFn
 	}
 
-	onPostCall := func(method string, xerr *xrpc.Error) {
-		if method == xrpc.MethodTokenRotate && xerr == nil {
+	onPostCall := func(_ string, xerr *xrpc.Error) {
+		if xerr == nil {
 			c.flushPendingCleanup()
 		}
 	}
 
-	c.managePort = newInboundPort("manage", cfg.Mode, cfg.MasterKey, c.creds.AgentTokens, c.methods, cfg.Now, onPostCall)
-	c.pullPort = newInboundPort("pull", cfg.Mode, cfg.MasterKey, c.creds.PullTokens, pullMethods, cfg.Now, nil)
+	c.managePort = newInboundPort("manage", cfg.Mode, cfg.MasterKey, c.creds.AgentTokens, c.methods, c.runtimeHealth, cfg.Now, onPostCall)
+	c.pullPort = newInboundPort("pull", cfg.Mode, cfg.MasterKey, c.creds.PullTokens, pullMethods, c.runtimeHealth, cfg.Now, nil)
 	c.gate = newListenGate(
 		cfg.Mode,
 		cfg.StealthDelay,
@@ -224,10 +260,21 @@ func (c *Client) addPendingCleanup(roles ...string) {
 	c.cleanupMu.Unlock()
 }
 
+func (c *Client) addPostAction(fn func()) {
+	if fn == nil {
+		return
+	}
+	c.cleanupMu.Lock()
+	c.postActions = append(c.postActions, fn)
+	c.cleanupMu.Unlock()
+}
+
 func (c *Client) flushPendingCleanup() {
 	c.cleanupMu.Lock()
 	todo := append([]string(nil), c.pendingRoles...)
 	c.pendingRoles = nil
+	actions := append([]func(){}, c.postActions...)
+	c.postActions = nil
 	c.cleanupMu.Unlock()
 	for _, r := range todo {
 		switch r {
@@ -238,6 +285,9 @@ func (c *Client) flushPendingCleanup() {
 		case "uplink":
 			c.uplink.ClearSession()
 		}
+	}
+	for _, fn := range actions {
+		fn()
 	}
 }
 
@@ -554,8 +604,9 @@ func wsURL(master string) string {
 func (c *Client) session(ctx context.Context) (authenticated bool, err error) {
 	dctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
+	masterAddr := c.getMasterURL()
 	// 升级请求只带 User-Agent，不带 Authorization：token 只在加密后的认证消息里出现。
-	ws, resp, err := websocket.Dial(dctx, wsURL(c.cfg.MasterURL), &websocket.DialOptions{
+	ws, resp, err := websocket.Dial(dctx, wsURL(masterAddr), &websocket.DialOptions{
 		HTTPHeader: http.Header{"User-Agent": {"satchel-agent/" + c.cfg.AgentVersion}},
 	})
 	if err != nil {
@@ -572,7 +623,16 @@ func (c *Client) session(ctx context.Context) (authenticated bool, err error) {
 		}
 		return false, fmt.Errorf("握手失败：%w", err)
 	}
-	auth := xrpc.Auth{Token: c.creds.Token(), AgentVersion: c.cfg.AgentVersion, ControlProtocol: xrpc.ControlProtocol, MinMasterVersion: MinMasterVersion}
+	info := c.runtimeInfo()
+	auth := xrpc.Auth{
+		Token:            c.creds.Token(),
+		AgentVersion:     info.AgentVersion,
+		ControlProtocol:  xrpc.ControlProtocol,
+		MinMasterVersion: MinMasterVersion,
+		InDocker:         info.InDocker,
+		MachineID:        info.MachineID,
+		MasterURL:        info.MasterURL,
+	}
 	if err := conn.Write(dctx, xrpc.TypeAuth, auth); err != nil {
 		return false, fmt.Errorf("发认证消息失败：%w", err)
 	}
@@ -595,7 +655,7 @@ func (c *Client) session(ctx context.Context) (authenticated bool, err error) {
 	c.gate.OnWSConnected()
 	defer c.gate.OnWSDisconnected()
 
-	c.cfg.Logger.Info("已连上主控", "master", c.cfg.MasterURL, "heartbeat", interval)
+	c.cfg.Logger.Info("已连上主控", "master", masterAddr, "heartbeat", interval)
 	return true, c.serve(ctx, conn, interval)
 }
 
@@ -603,12 +663,23 @@ func (c *Client) session(ctx context.Context) (authenticated bool, err error) {
 func (c *Client) serve(ctx context.Context, conn *xrpc.Conn, interval time.Duration) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	c.setActiveWSCancel(cancel)
+	defer c.clearActiveWSCancel(cancel)
+
 	readErr := make(chan error, 1)
 	go func() { readErr <- c.read(ctx, conn) }()
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
-		if err := c.write(ctx, conn, xrpc.TypeHeartbeat, xrpc.Heartbeat{BootTime: c.boot}); err != nil {
+		info := c.runtimeInfo()
+		hb := xrpc.Heartbeat{
+			BootTime:     c.boot,
+			AgentVersion: info.AgentVersion,
+			InDocker:     info.InDocker,
+			MachineID:    info.MachineID,
+			MasterURL:    info.MasterURL,
+		}
+		if err := c.write(ctx, conn, xrpc.TypeHeartbeat, hb); err != nil {
 			return fmt.Errorf("发心跳失败：%w", err)
 		}
 		select {
@@ -653,7 +724,7 @@ func (c *Client) read(ctx context.Context, conn *xrpc.Conn) error {
 				if err != nil {
 					c.cfg.Logger.Warn("回复主控的请求失败", "method", call.Method, "err", err)
 				}
-				if call.Method == xrpc.MethodTokenRotate && reply.Error == nil {
+				if reply.Error == nil {
 					c.flushPendingCleanup()
 				}
 			}()
@@ -685,23 +756,9 @@ func (c *Client) handleTokenRotate(_ context.Context, raw json.RawMessage) (any,
 	c.rotateMu.Lock()
 	defer c.rotateMu.Unlock()
 
-	var updated config.Config
-	if c.cfg.ConfigPath != "" {
-		loaded, err := config.Load(c.cfg.ConfigPath)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, &xrpc.Error{Code: xrpc.CodeBadParams, Message: err.Error()}
-		}
-		if err == nil {
-			updated = loaded
-		}
-	}
-	if updated.MasterURL == "" {
-		updated.MasterURL = c.cfg.MasterURL
-		updated.MasterPublicKey = securechan.EncodePublicKey(c.cfg.MasterKey)
-		updated.ConnectionMode = c.cfg.Mode
-		updated.ListenPort = c.cfg.ListenPort
-		updated.PullPort = c.cfg.PullPort
-		c.creds.FillConfig(&updated)
+	updated, err := c.loadConfigForEditLocked()
+	if err != nil {
+		return nil, &xrpc.Error{Code: xrpc.CodeBadParams, Message: err.Error()}
 	}
 	if p.Token != "" {
 		updated.Token = p.Token
@@ -712,19 +769,8 @@ func (c *Client) handleTokenRotate(_ context.Context, raw json.RawMessage) (any,
 	if p.PullToken != "" {
 		updated.PullToken = p.PullToken
 	}
-	if c.cfg.SaveConfig != nil {
-		if err := updated.Validate(); err != nil {
-			return nil, &xrpc.Error{Code: xrpc.CodeBadParams, Message: err.Error()}
-		}
-		if err := c.cfg.SaveConfig(updated); err != nil {
-			return nil, &xrpc.Error{Code: xrpc.CodeBadParams, Message: fmt.Sprintf("保存新凭据配置失败：%v", err)}
-		}
-	} else if c.cfg.ConfigPath != "" {
-		if err := config.Save(c.cfg.ConfigPath, updated); err != nil {
-			return nil, &xrpc.Error{Code: xrpc.CodeBadParams, Message: fmt.Sprintf("保存新凭据配置失败：%v", err)}
-		}
-	} else {
-		return nil, &xrpc.Error{Code: xrpc.CodeBadParams, Message: "未配置 config_path，无法持久化轮换后的凭据"}
+	if err := c.persistConfigLocked(updated); err != nil {
+		return nil, &xrpc.Error{Code: xrpc.CodeBadParams, Message: fmt.Sprintf("保存新凭据配置失败：%v", err)}
 	}
 
 	c.creds.Apply(p.Token, p.AgentToken, p.PullToken)

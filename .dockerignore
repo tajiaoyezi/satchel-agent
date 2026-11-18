@@ -1,0 +1,13 @@
+.git
+.github
+.idea
+.vscode
+.claude
+.cursor
+.agents
+/satchel-agent
+/dist
+*.test
+docker-compose.yml
+.env
+*.md
