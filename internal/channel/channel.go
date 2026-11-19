@@ -23,6 +23,7 @@ import (
 
 	"github.com/satchel/satchel-agent/internal/config"
 	"github.com/satchel/satchel-agent/internal/pathguard"
+	"github.com/satchel/satchel-agent/internal/telemetry"
 	"github.com/satchel/satchel-agent/internal/updater"
 )
 
@@ -33,7 +34,8 @@ const (
 	handshakeTimeout = 10 * time.Second
 	writeTimeout     = 10 * time.Second
 	// defaultHeartbeat 是主控没给心跳间隔时用的间隔。
-	defaultHeartbeat = 30 * time.Second
+	defaultHeartbeat    = 30 * time.Second
+	defaultSpeedCollect = 3 * time.Second
 
 	defaultWSProbeInterval = 60 * time.Second
 	defaultHTTPFailLimit   = 5
@@ -93,9 +95,14 @@ type Config struct {
 	Root                  string
 	MachineID             string
 	StagingDir            string
-	ReleaseSources        release.Sources
-	UpdateApply           func(context.Context, updater.Options) (*updater.Result, error)
-	UninstallSpawn        func(context.Context, updater.DetachOptions) (string, error)
+	ReleaseSources         release.Sources
+	UpdateApply            func(context.Context, updater.Options) (*updater.Result, error)
+	UninstallSpawn         func(context.Context, updater.DetachOptions) (string, error)
+	SpeedCollector         *telemetry.SpeedCollector
+	SysCollector           *telemetry.SysCollector
+	SpeedCollectInterval   time.Duration
+	TrafficCollectInterval time.Duration
+	OnAgentConfig          func(xrpc.AgentConfig)
 }
 
 // AuthError 是主控拒绝了认证（或握手时主控公钥对不上）。
@@ -138,9 +145,18 @@ type Client struct {
 	pendingRoles []string
 	postActions  []func()
 
-	wakeupCh chan struct{}
-	wsWakeCh chan struct{}
-	wakeSeq  atomic.Uint64
+	wakeupCh  chan struct{}
+	wsWakeCh  chan struct{}
+	cfgWakeCh chan struct{}
+	wakeSeq   atomic.Uint64
+
+	rtMu         sync.RWMutex
+	rtHeartbeat  time.Duration
+	rtSpeed      time.Duration
+	rtTraffic    time.Duration
+	rtAgentLog   bool
+	rtLastConfig xrpc.AgentConfig
+	rtHasConfig  bool
 }
 
 // New 建通道。
@@ -198,6 +214,10 @@ func New(cfg Config) *Client {
 		pullPort = config.DefaultPullPort
 	}
 
+	speedInt := cfg.SpeedCollectInterval
+	if speedInt <= 0 {
+		speedInt = defaultSpeedCollect
+	}
 	c := &Client{
 		cfg:       cfg,
 		root:      root,
@@ -208,6 +228,9 @@ func New(cfg Config) *Client {
 		creds:     newCredStore(cfg.Token, cfg.AgentToken, cfg.PullToken),
 		wakeupCh:  make(chan struct{}, 1),
 		wsWakeCh:  make(chan struct{}, 1),
+		cfgWakeCh: make(chan struct{}, 1),
+		rtSpeed:   speedInt,
+		rtTraffic: cfg.TrafficCollectInterval,
 	}
 
 	baseMethods := xrpc.Methods{
@@ -225,14 +248,18 @@ func New(cfg Config) *Client {
 	baseMethods[xrpc.MethodAgentSwitchPorts] = c.handleAgentSwitchPorts
 	baseMethods[xrpc.MethodAgentProbeMaster] = c.handleAgentProbeMaster
 	baseMethods[xrpc.MethodAgentUpdateMaster] = c.handleAgentUpdateMaster
+	baseMethods[xrpc.MethodAgentConfigUpdate] = c.handleAgentConfigUpdate
 	c.methods = baseMethods
 
-	// 只读轮询口仅暴露 traffic.snapshot 与 agent.health，绝不挂载任何管理写或生命周期控制动作。
+	// 只读轮询口仅暴露 agent.health、traffic.snapshot 与 speed.get，绝不挂载 system.info、system.nics、日志或管理写方法。
 	pullMethods := xrpc.Methods{
 		xrpc.MethodAgentHealth: baseMethods[xrpc.MethodAgentHealth],
 	}
 	if snapFn, ok := baseMethods[xrpc.MethodTrafficSnapshot]; ok {
 		pullMethods[xrpc.MethodTrafficSnapshot] = snapFn
+	}
+	if speedFn, ok := baseMethods[xrpc.MethodSpeedGet]; ok {
+		pullMethods[xrpc.MethodSpeedGet] = speedFn
 	}
 
 	onPostCall := func(_ string, xerr *xrpc.Error) {
@@ -427,8 +454,9 @@ func (c *Client) runWebsocketLoop(ctx context.Context) error {
 func (c *Client) runHTTPOnlyLoop(ctx context.Context) error {
 	failures, authFailures, invalid := 0, 0, 0
 	hbInterval := c.cfg.HTTPHeartbeatInterval
+	var lastTraffic time.Time
 	for {
-		interval, err := c.sendHTTPRound(ctx)
+		interval, err := c.sendHTTPRound(ctx, &lastTraffic, true)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -437,7 +465,7 @@ func (c *Client) runHTTPOnlyLoop(ctx context.Context) error {
 			if interval > 0 {
 				hbInterval = interval
 			}
-			if _, werr := c.waitOrWake(ctx, hbInterval); werr != nil {
+			if _, werr := c.waitHTTPHealthy(ctx, hbInterval, nil); werr != nil {
 				return nil
 			}
 			continue
@@ -501,7 +529,7 @@ func (c *Client) runAutoLoop(ctx context.Context) error {
 	}
 }
 
-// runAutoHTTPLoop 在 auto 降级期执行加密 HTTP 心跳与流量上报，并周期探测 WS：
+// runAutoHTTPLoop 在 auto 降级期执行加密 HTTP 心跳、实时网速与流量上报，并周期探测 WS：
 // - 若 WS 探测接通，保持在该 WS 会话运行直至断开并返回 wasWS=true；
 // - 若 HTTP 连续失败达 cfg.HTTPFailLimit 次，返回 wasWS=false 以落入 pull 兜底窗口。
 func (c *Client) runAutoHTTPLoop(ctx context.Context) (wasWS bool, lastErr error) {
@@ -510,9 +538,10 @@ func (c *Client) runAutoHTTPLoop(ctx context.Context) (wasWS bool, lastErr error
 
 	failures := 0
 	hbInterval := c.cfg.HTTPHeartbeatInterval
+	var lastTraffic time.Time
 
 	for {
-		interval, err := c.sendHTTPRound(ctx)
+		interval, err := c.sendHTTPRound(ctx, &lastTraffic, true)
 		if ctx.Err() != nil {
 			return false, nil
 		}
@@ -521,22 +550,14 @@ func (c *Client) runAutoHTTPLoop(ctx context.Context) (wasWS bool, lastErr error
 			if interval > 0 {
 				hbInterval = interval
 			}
-			t := time.NewTimer(hbInterval)
-			select {
-			case <-ctx.Done():
-				t.Stop()
+			needProbe, werr := c.waitHTTPHealthy(ctx, hbInterval, probeTicker.C)
+			if werr != nil {
 				return false, nil
-			case <-c.wakeupCh:
-				t.Stop()
+			}
+			if needProbe {
 				if authOK, _ := c.session(ctx); authOK {
 					return true, nil
 				}
-			case <-probeTicker.C:
-				t.Stop()
-				if authOK, _ := c.session(ctx); authOK {
-					return true, nil
-				}
-			case <-t.C:
 			}
 			continue
 		}
@@ -571,22 +592,190 @@ func (c *Client) runAutoHTTPLoop(ctx context.Context) (wasWS bool, lastErr error
 	}
 }
 
-func (c *Client) sendHTTPRound(ctx context.Context) (time.Duration, error) {
-	rep, err := c.uplink.Call(ctx, xrpc.HTTPRPCMethodHeartbeat, &xrpc.HTTPHeartbeatPayload{BootTime: c.boot}, nil)
+func (c *Client) waitHTTPHealthy(ctx context.Context, hbInterval time.Duration, probeCh <-chan time.Time) (needProbe bool, err error) {
+	hbTimer := time.NewTimer(hbInterval)
+	defer hbTimer.Stop()
+
+	var speedTicker *time.Ticker
+	var speedCh <-chan time.Time
+	curSpeed := c.currentSpeedInterval()
+	if c.cfg.SpeedCollector != nil {
+		speedTicker = time.NewTicker(curSpeed)
+		defer speedTicker.Stop()
+		speedCh = speedTicker.C
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-c.wakeupCh:
+			return true, nil
+		case <-probeCh:
+			return true, nil
+		case <-c.cfgWakeCh:
+			if speedTicker != nil {
+				if next := c.currentSpeedInterval(); next != curSpeed {
+					curSpeed = next
+					speedTicker.Reset(curSpeed)
+				}
+			}
+			if nextHB := c.currentHeartbeatInterval(hbInterval); nextHB < hbInterval {
+				return false, nil
+			}
+		case <-speedCh:
+			if serr := c.sendHTTPSpeed(ctx); serr != nil && ctx.Err() == nil {
+				c.cfg.Logger.Debug("HTTP 实时网速上报失败", "err", serr)
+			}
+		case <-hbTimer.C:
+			return false, nil
+		}
+	}
+}
+
+func (c *Client) sendHTTPRound(ctx context.Context, lastTraffic *time.Time, sendSpeed bool) (time.Duration, error) {
+	rep, err := c.uplink.Call(ctx, xrpc.HTTPRPCMethodHeartbeat, &xrpc.HTTPHeartbeatPayload{BootTime: c.boot}, nil, nil)
 	if err != nil {
 		return 0, err
 	}
 	if snapFn, ok := c.methods[xrpc.MethodTrafficSnapshot]; ok {
-		if rawSnap, serr := snapFn(ctx, nil); serr == nil {
-			if snap, ok := rawSnap.(xrpc.TrafficSnapshot); ok {
-				_, _ = c.uplink.Call(ctx, xrpc.HTTPRPCMethodTraffic, nil, &snap)
+		ti := c.currentTrafficInterval()
+		now := c.cfg.Now()
+		if ti <= 0 || lastTraffic == nil || lastTraffic.IsZero() || now.Sub(*lastTraffic) >= ti {
+			if rawSnap, serr := snapFn(ctx, nil); serr == nil {
+				if snap, ok := rawSnap.(xrpc.TrafficSnapshot); ok {
+					if _, terr := c.uplink.Call(ctx, xrpc.HTTPRPCMethodTraffic, nil, &snap, nil); terr == nil && lastTraffic != nil {
+						*lastTraffic = now
+					}
+				}
 			}
 		}
+	}
+	if sendSpeed && c.cfg.SpeedCollector != nil {
+		if serr := c.sendHTTPSpeed(ctx); serr != nil && ctx.Err() == nil {
+			c.cfg.Logger.Debug("HTTP 首次实时网速上报失败", "err", serr)
+		}
+	}
+	if hb := c.currentHeartbeatInterval(0); hb > 0 {
+		return hb, nil
 	}
 	if rep.HeartbeatInterval > 0 {
 		return time.Duration(rep.HeartbeatInterval) * time.Second, nil
 	}
 	return 0, nil
+}
+
+func (c *Client) sendHTTPSpeed(ctx context.Context) error {
+	if c.cfg.SpeedCollector == nil {
+		return nil
+	}
+	rep := c.sampleSpeedReport()
+	_, err := c.uplink.Call(ctx, xrpc.HTTPRPCMethodSpeed, nil, nil, &rep)
+	if err == nil {
+		c.cfg.Logger.Debug("已通过 HTTP 上报实时网速", "up", rep.UploadSpeed, "down", rep.DownloadSpeed)
+	}
+	return err
+}
+
+func (c *Client) sampleSpeedReport() xrpc.SpeedReport {
+	if c.cfg.SysCollector != nil {
+		c.cfg.SysCollector.SampleCPU()
+	}
+	return c.cfg.SpeedCollector.Sample()
+}
+
+func (c *Client) applyRuntimeConfig(ac xrpc.AgentConfig) {
+	c.rtMu.Lock()
+	had := c.rtHasConfig
+	prev := c.rtLastConfig
+	changedInterval := false
+	if ac.HeartbeatInterval > 0 {
+		d := time.Duration(ac.HeartbeatInterval) * time.Second
+		if d != c.rtHeartbeat {
+			c.rtHeartbeat = d
+			changedInterval = true
+		}
+	}
+	if ac.SpeedCollectInterval > 0 {
+		d := time.Duration(ac.SpeedCollectInterval) * time.Second
+		if d != c.rtSpeed {
+			c.rtSpeed = d
+			changedInterval = true
+		}
+	}
+	if ac.TrafficCollectInterval > 0 {
+		d := time.Duration(ac.TrafficCollectInterval) * time.Second
+		if d != c.rtTraffic {
+			c.rtTraffic = d
+			changedInterval = true
+		}
+	}
+	prevLog := c.rtAgentLog
+	c.rtAgentLog = ac.AgentLogEnabled
+	c.rtLastConfig = ac
+	c.rtHasConfig = true
+	c.rtMu.Unlock()
+
+	if c.cfg.OnAgentConfig != nil && (!had || prev != ac) {
+		c.cfg.OnAgentConfig(ac)
+	}
+	if !had || prevLog != ac.AgentLogEnabled {
+		c.cfg.Logger.Info("已同步节点运行配置",
+			"agent_log_enabled", ac.AgentLogEnabled,
+			"heartbeat_interval", ac.HeartbeatInterval,
+			"speed_collect_interval", ac.SpeedCollectInterval,
+			"traffic_collect_interval", ac.TrafficCollectInterval,
+		)
+		c.cfg.Logger.Debug("节点调试日志已开启", "agent_log_enabled", ac.AgentLogEnabled)
+	}
+	if changedInterval {
+		select {
+		case c.cfgWakeCh <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (c *Client) handleAgentConfigUpdate(_ context.Context, raw json.RawMessage) (any, error) {
+	var p xrpc.AgentConfigUpdate
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return nil, &xrpc.Error{Code: xrpc.CodeBadParams, Message: fmt.Sprintf("agent.config_update 参数解不开：%v", err)}
+	}
+	c.applyRuntimeConfig(p)
+	c.cfg.Logger.Debug("已应用主控热推运行配置",
+		"heartbeat_interval", p.HeartbeatInterval,
+		"speed_collect_interval", p.SpeedCollectInterval,
+		"traffic_collect_interval", p.TrafficCollectInterval,
+		"agent_log_enabled", p.AgentLogEnabled,
+	)
+	return xrpc.AgentConfigUpdateAck{Applied: p, UpdatedAt: c.cfg.Now().UTC()}, nil
+}
+
+func (c *Client) currentHeartbeatInterval(fallback time.Duration) time.Duration {
+	c.rtMu.RLock()
+	d := c.rtHeartbeat
+	c.rtMu.RUnlock()
+	if d > 0 {
+		return d
+	}
+	return fallback
+}
+
+func (c *Client) currentSpeedInterval() time.Duration {
+	c.rtMu.RLock()
+	d := c.rtSpeed
+	c.rtMu.RUnlock()
+	if d > 0 {
+		return d
+	}
+	return defaultSpeedCollect
+}
+
+func (c *Client) currentTrafficInterval() time.Duration {
+	c.rtMu.RLock()
+	d := c.rtTraffic
+	c.rtMu.RUnlock()
+	return d
 }
 
 func wsURL(master string) string {
@@ -648,7 +837,13 @@ func (c *Client) session(ctx context.Context) (authenticated bool, err error) {
 		return false, &AuthError{Reason: res.Reason, Message: res.Message}
 	}
 	cancel()
+	if res.Config != nil {
+		c.applyRuntimeConfig(*res.Config)
+	}
 	interval := time.Duration(res.HeartbeatInterval) * time.Second
+	if res.Config != nil && res.Config.HeartbeatInterval > 0 {
+		interval = time.Duration(res.Config.HeartbeatInterval) * time.Second
+	}
 	if interval <= 0 {
 		interval = defaultHeartbeat
 	}
@@ -659,7 +854,7 @@ func (c *Client) session(ctx context.Context) (authenticated bool, err error) {
 	return true, c.serve(ctx, conn, interval)
 }
 
-// serve 认证之后的循环：立即发一次心跳，之后按间隔发；读循环回应请求，收到 IP 漂移唤醒时立即短 ping 探活。
+// serve 认证之后的循环：立即发一次心跳，之后按动态周期发心跳与实时网速；读循环回应请求，收到 IP 漂移唤醒时立即短 ping 探活。
 func (c *Client) serve(ctx context.Context, conn *xrpc.Conn, interval time.Duration) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -668,9 +863,8 @@ func (c *Client) serve(ctx context.Context, conn *xrpc.Conn, interval time.Durat
 
 	readErr := make(chan error, 1)
 	go func() { readErr <- c.read(ctx, conn) }()
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
+
+	sendHeartbeat := func() error {
 		info := c.runtimeInfo()
 		hb := xrpc.Heartbeat{
 			BootTime:     c.boot,
@@ -682,6 +876,26 @@ func (c *Client) serve(ctx context.Context, conn *xrpc.Conn, interval time.Durat
 		if err := c.write(ctx, conn, xrpc.TypeHeartbeat, hb); err != nil {
 			return fmt.Errorf("发心跳失败：%w", err)
 		}
+		return nil
+	}
+	if err := sendHeartbeat(); err != nil {
+		return err
+	}
+
+	curHB := c.currentHeartbeatInterval(interval)
+	hbTicker := time.NewTicker(curHB)
+	defer hbTicker.Stop()
+
+	var speedTicker *time.Ticker
+	var speedCh <-chan time.Time
+	curSpeed := c.currentSpeedInterval()
+	if c.cfg.SpeedCollector != nil {
+		speedTicker = time.NewTicker(curSpeed)
+		defer speedTicker.Stop()
+		speedCh = speedTicker.C
+	}
+
+	for {
 		select {
 		case <-ctx.Done():
 			conn.Close(websocket.StatusGoingAway, "agent stopping")
@@ -695,7 +909,30 @@ func (c *Client) serve(ctx context.Context, conn *xrpc.Conn, interval time.Durat
 			if perr != nil {
 				return fmt.Errorf("IP 变化后连接探活失败：%w", perr)
 			}
-		case <-t.C:
+			if err := sendHeartbeat(); err != nil {
+				return err
+			}
+		case <-c.cfgWakeCh:
+			if nextHB := c.currentHeartbeatInterval(curHB); nextHB > 0 && nextHB != curHB {
+				curHB = nextHB
+				hbTicker.Reset(curHB)
+			}
+			if speedTicker != nil {
+				if nextSpd := c.currentSpeedInterval(); nextSpd > 0 && nextSpd != curSpeed {
+					curSpeed = nextSpd
+					speedTicker.Reset(curSpeed)
+				}
+			}
+		case <-speedCh:
+			rep := c.sampleSpeedReport()
+			if err := c.write(ctx, conn, xrpc.TypeSpeed, rep); err != nil {
+				return fmt.Errorf("发实时网速失败：%w", err)
+			}
+			c.cfg.Logger.Debug("已通过 WS 上报实时网速", "up", rep.UploadSpeed, "down", rep.DownloadSpeed)
+		case <-hbTicker.C:
+			if err := sendHeartbeat(); err != nil {
+				return err
+			}
 		}
 	}
 }

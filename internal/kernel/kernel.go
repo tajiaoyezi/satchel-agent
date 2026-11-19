@@ -11,6 +11,7 @@ import (
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/include"
+	singlog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
 
@@ -22,7 +23,8 @@ var ErrRunning = errors.New("内核已经在运行，先 Stop 再 Start")
 
 // Kernel 是一个可以反复起停的 sing-box 内核。
 type Kernel struct {
-	tracker *tracker.Tracker
+	tracker   *tracker.Tracker
+	logWriter singlog.PlatformWriter
 
 	mu        sync.Mutex
 	instance  *box.Box
@@ -33,6 +35,13 @@ type Kernel struct {
 // New 建一个内核，t 在每次启动时挂上去。
 func New(t *tracker.Tracker) *Kernel {
 	return &Kernel{tracker: t}
+}
+
+// SetLogWriter 注入内嵌 sing-box 的日志写出目标（用于写入同目录轮转 core.log）。
+func (k *Kernel) SetLogWriter(w singlog.PlatformWriter) {
+	k.mu.Lock()
+	k.logWriter = w
+	k.mu.Unlock()
 }
 
 // Tracker 返回挂在这个内核上的 tracker。
@@ -72,7 +81,7 @@ func (k *Kernel) startLocked(ctx context.Context, config []byte) error {
 		cancel()
 		return err
 	}
-	instance, err := box.New(box.Options{Context: boxCtx, Options: options})
+	instance, err := box.New(box.Options{Context: boxCtx, Options: options, PlatformLogWriter: k.logWriter})
 	if err != nil {
 		cancel()
 		return err

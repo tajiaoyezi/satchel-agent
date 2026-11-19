@@ -76,8 +76,9 @@ func (p *inboundPort) Handler() http.Handler {
 	mux.HandleFunc(xrpc.HTTPNodePathHandshakeFinish, p.handleHandshakeFinish)
 	mux.HandleFunc(xrpc.HTTPNodePathRPC, p.handleRPC)
 	if p.role == "pull" {
-		// 只读轮询口同时暴露精简拉取路径，但仍强制走相同加密 RPC 与方法白名单校验。
+		// 只读轮询口同时暴露精简拉取路径，但仍强制走相同加密 RPC 与方法白名单校验（仅 traffic.snapshot 与 speed.get）。
 		mux.HandleFunc(xrpc.HTTPNodePathPullTraffic, p.handleRPC)
+		mux.HandleFunc(xrpc.HTTPNodePathPullSpeed, p.handleRPC)
 	}
 	return p.silentAuthMiddleware(mux)
 }

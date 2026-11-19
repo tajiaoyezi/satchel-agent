@@ -119,7 +119,8 @@ func (u *httpUplink) handshake(ctx context.Context) (string, *securechan.Session
 }
 
 // Call 向主控 POST /api/remote/rpc 发送一次加密 RPC；若主控返回 412 则清缓存重握手并重试一次。
-func (u *httpUplink) Call(ctx context.Context, method string, hb *xrpc.HTTPHeartbeatPayload, snap *xrpc.TrafficSnapshot) (*xrpc.AgentHTTPRPCReply, error) {
+// 每次成功回复若附带 Config，均立即应用到本地运行配置（包括 agent_log_enabled 与各采集间隔）。
+func (u *httpUplink) Call(ctx context.Context, method string, hb *xrpc.HTTPHeartbeatPayload, snap *xrpc.TrafficSnapshot, speed *xrpc.SpeedReport) (*xrpc.AgentHTTPRPCReply, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		sid, sess, err := u.getSession(ctx)
 		if err != nil {
@@ -137,6 +138,7 @@ func (u *httpUplink) Call(ctx context.Context, method string, hb *xrpc.HTTPHeart
 			MasterURL:        info.MasterURL,
 			Heartbeat:        hb,
 			Traffic:          snap,
+			Speed:            speed,
 		}
 		plain, err := json.Marshal(payload)
 		if err != nil {
@@ -196,6 +198,9 @@ func (u *httpUplink) Call(ctx context.Context, method string, hb *xrpc.HTTPHeart
 			default:
 				return nil, fmt.Errorf("主控拒绝 HTTP %s（%s）：%s", method, reply.Reason, reply.Message)
 			}
+		}
+		if reply.Config != nil {
+			u.c.applyRuntimeConfig(*reply.Config)
 		}
 		return &reply, nil
 	}

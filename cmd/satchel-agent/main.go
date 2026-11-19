@@ -17,7 +17,10 @@ import (
 	"syscall"
 	"time"
 
+	singlog "github.com/sagernet/sing-box/log"
+
 	"github.com/satchel/satchel/pkg/release"
+	"github.com/satchel/satchel/pkg/xrpc"
 
 	"github.com/satchel/satchel-agent/internal/buildinfo"
 	"github.com/satchel/satchel-agent/internal/channel"
@@ -25,6 +28,8 @@ import (
 	"github.com/satchel/satchel-agent/internal/control"
 	"github.com/satchel/satchel-agent/internal/kernel"
 	"github.com/satchel/satchel-agent/internal/limits"
+	"github.com/satchel/satchel-agent/internal/logging"
+	"github.com/satchel/satchel-agent/internal/telemetry"
 	"github.com/satchel/satchel-agent/internal/tracker"
 	"github.com/satchel/satchel-agent/internal/updater"
 )
@@ -34,8 +39,8 @@ const kernelConfig = control.KernelConfig
 
 const usage = `用法：
   satchel-agent join --master-url <url> --token <token> --master-key <key> --mode <mode>
-                     [--agent-token <token>] [--pull-token <token>] [--listen-port <port>] [--pull-port <port>] [--config <path>]
-  satchel-agent run [--config <path>]
+                     [--agent-token <token>] [--pull-token <token>] [--listen-port <port>] [--pull-port <port>] [--log-path <path>] [--config <path>]
+  satchel-agent run [--config <path>] [--log-path <path>]
   satchel-agent update [<version>] [--channel stable|prerelease] [--yes]
   satchel-agent uninstall [--yes] [--detach-delay <duration>]
   satchel-agent --version
@@ -107,6 +112,7 @@ func join(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&c.ConnectionMode, "mode", "", "连接模式（auto、websocket、http 或 pull）")
 	fs.IntVar(&c.ListenPort, "listen-port", 0, "节点管理监听端口（0 表示按默认 23889）")
 	fs.IntVar(&c.PullPort, "pull-port", 0, "节点只读轮询端口（0 表示按默认 23890）")
+	fs.StringVar(&c.LogPath, "log-path", "", "节点轮转日志文件路径（可选，默认 <state-dir>/logs/satchel-agent.log）")
 	path := fs.String("config", config.DefaultPath, "配置文件的位置")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -131,6 +137,7 @@ func serve(args []string, stderr io.Writer) int {
 	fs := flag.NewFlagSet("satchel-agent run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	path := fs.String("config", config.DefaultPath, "配置文件的位置")
+	logPathFlag := fs.String("log-path", "", "节点轮转日志文件路径覆盖")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -142,11 +149,22 @@ func serve(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	logger := slog.New(slog.NewTextHandler(stderr, nil))
+	logCfg := strings.TrimSpace(*logPathFlag)
+	if logCfg == "" {
+		logCfg = c.LogPath
+	}
+	logPath := config.EffectiveLogPath(*path, logCfg)
+	logSet, err := logging.Setup(logPath, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, "初始化日志文件失败：", err)
+		return 1
+	}
+	defer logSet.Close()
+	logger := logSet.Logger
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
-	logger.Info("satchel-agent 启动", "version", buildinfo.Get().Version, "master", c.MasterURL, "mode", c.ConnectionMode)
-	return runAgent(ctx, filepath.Dir(*path), channel.Config{
+	logger.Info("satchel-agent 启动", "version", buildinfo.Get().Version, "master", c.MasterURL, "mode", c.ConnectionMode, "log_path", logPath)
+	return runAgentWithLogs(ctx, filepath.Dir(*path), channel.Config{
 		MasterURL:       c.MasterURL,
 		Token:           c.Token,
 		AgentToken:      c.AgentToken,
@@ -160,12 +178,19 @@ func serve(args []string, stderr io.Writer) int {
 		IPProber:        channel.DefaultIPProber,
 		AgentVersion:    buildinfo.Get().Version,
 		Logger:          logger,
-	}, logger)
+		OnAgentConfig: func(ac xrpc.AgentConfig) {
+			logSet.SetDebugEnabled(ac.AgentLogEnabled)
+		},
+	}, logger, logSet)
 }
 
-// runAgent 按配置目录起内核、给通道装上连接管控的方法、连主控，直到 ctx 结束或收到升级原地重启/卸载退出请求；
+// runAgent 按配置目录起内核、给通道装上连接管控与遥测日志方法、连主控，直到 ctx 结束或收到升级原地重启/卸载退出请求；
 // 结束时先断通道、先取消内核启动用的 ctx、再停内核，最后如收到 RequestExec 则原地 syscall.Exec 新二进制。
 func runAgent(ctx context.Context, dir string, cfg channel.Config, logger *slog.Logger) int {
+	return runAgentWithLogs(ctx, dir, cfg, logger, nil)
+}
+
+func runAgentWithLogs(ctx context.Context, dir string, cfg channel.Config, logger *slog.Logger, logSet *logging.LoggerSet) int {
 	runCtx, stopRun := context.WithCancel(ctx)
 	defer stopRun()
 
@@ -188,10 +213,41 @@ func runAgent(ctx context.Context, dir string, cfg channel.Config, logger *slog.
 		cfg.RequestStop = stopRun
 	}
 
+	var coreLogWriter singlog.PlatformWriter
+	logDir := filepath.Join(dir, "logs")
+	agentLogFile := logging.DefaultAgentLogFile
+	coreLogFile := logging.CoreLogFile
+	if logSet != nil {
+		coreLogWriter = logSet.CorePlatformWriter()
+		logDir = logSet.LogDir
+		agentLogFile = filepath.Base(logSet.AgentLogPath)
+		coreLogFile = filepath.Base(logSet.CoreLogPath)
+	}
+
+	sysCol := telemetry.NewSysCollector(telemetry.SysReader{
+		InDocker:      func() bool { return release.InDocker("/") },
+		AgentVersion:  cfg.AgentVersion,
+		CPUProbeDelay: 100 * time.Millisecond,
+	})
+	sysCol.SampleCPU()
+	speedCol := telemetry.NewSpeedCollector(nil, nil)
+	speedCol.Sample()
+	logInsp := telemetry.NewLogInspector(logDir, agentLogFile, coreLogFile)
+
 	kernelCtx, cancelKernel := context.WithCancel(runCtx)
 	defer cancelKernel()
-	deps, k := startKernel(kernelCtx, dir, logger)
+	deps, k := startKernelWithLogWriter(kernelCtx, dir, logger, coreLogWriter)
+	deps.Sys = sysCol
+	deps.Speed = speedCol
+	deps.Logs = logInsp
+	deps.ListNICs = telemetry.ListNICs
 	cfg.Methods = control.Methods(deps)
+	if cfg.SpeedCollector == nil {
+		cfg.SpeedCollector = speedCol
+	}
+	if cfg.SysCollector == nil {
+		cfg.SysCollector = sysCol
+	}
 	err := channel.New(cfg).Run(runCtx)
 	cancelKernel()
 	logger.Info("已断开主控，停内核")
@@ -328,12 +384,19 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 // 里的限速来源重放进 tracker，再按 kernel.json 起内核。状态文件坏了、内核配置解析不了或内核起不来都只记日志，不影响连主控。
 // ctx 只管内核启动（含随后 kernel.restart 的启动）：启动期间收到退出信号就放弃启动。
 func startKernel(ctx context.Context, dir string, logger *slog.Logger) (control.Deps, *kernel.Kernel) {
+	return startKernelWithLogWriter(ctx, dir, logger, nil)
+}
+
+func startKernelWithLogWriter(ctx context.Context, dir string, logger *slog.Logger, coreLogWriter singlog.PlatformWriter) (control.Deps, *kernel.Kernel) {
 	tr := tracker.New()
 	store, err := limits.Open(filepath.Join(dir, limits.FileName), tr, time.Now)
 	if err != nil {
 		logger.Error("限速状态没能完整读回或重写（读回了的已经生效，下次改动时会重写这个文件）", "err", err)
 	}
 	k := kernel.New(tr)
+	if coreLogWriter != nil {
+		k.SetLogWriter(coreLogWriter)
+	}
 	inbounds := control.NewInbounds(nil)
 	deps := control.Deps{Limits: store, Tracker: tr, Kernel: k, Inbounds: inbounds, KernelCtx: ctx, ConfigDir: dir}
 	config, tags, err := control.ReadKernelConfig(dir)

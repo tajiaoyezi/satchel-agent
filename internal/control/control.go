@@ -19,6 +19,7 @@ import (
 
 	"github.com/satchel/satchel-agent/internal/kernel"
 	"github.com/satchel/satchel-agent/internal/limits"
+	"github.com/satchel/satchel-agent/internal/telemetry"
 	"github.com/satchel/satchel-agent/internal/tracker"
 )
 
@@ -83,6 +84,10 @@ type Deps struct {
 	KernelCtx context.Context
 	ConfigDir string
 	Now       func() time.Time
+	Sys       *telemetry.SysCollector
+	Speed     *telemetry.SpeedCollector
+	Logs      *telemetry.LogInspector
+	ListNICs  func() ([]xrpc.NICInfo, error)
 }
 
 func badParams(format string, args ...any) *xrpc.Error {
@@ -144,12 +149,12 @@ func checkSource(source string) error {
 	return nil
 }
 
-// Methods 返回六个方法的处理函数。
+// Methods 返回连接管控、流量、内核与遥测日志方法的处理函数。
 func Methods(d Deps) xrpc.Methods {
 	if d.Inbounds == nil {
 		d.Inbounds = NewInbounds(nil)
 	}
-	return xrpc.Methods{
+	m := xrpc.Methods{
 		xrpc.MethodLimiterSet: func(_ context.Context, raw json.RawMessage) (any, error) {
 			// 外层的 BPS 是指针，用来分出「没给」与「给了 0」（0 是显式不限速，没给不能当成 0）；JSON 解码时外层字段优先。
 			var p struct {
@@ -270,4 +275,41 @@ func Methods(d Deps) xrpc.Methods {
 			return out, nil
 		},
 	}
+	if d.Sys != nil {
+		m[xrpc.MethodSystemInfo] = func(context.Context, json.RawMessage) (any, error) {
+			return d.Sys.Info(), nil
+		}
+	}
+	if d.ListNICs != nil {
+		m[xrpc.MethodSystemNICs] = func(context.Context, json.RawMessage) (any, error) {
+			nics, err := d.ListNICs()
+			if err != nil {
+				return nil, err
+			}
+			if nics == nil {
+				nics = []xrpc.NICInfo{}
+			}
+			return xrpc.SystemNICs{NICs: nics}, nil
+		}
+	}
+	if d.Speed != nil {
+		m[xrpc.MethodSpeedGet] = func(context.Context, json.RawMessage) (any, error) {
+			return d.Speed.LatestOrSample(), nil
+		}
+	}
+	if d.Logs != nil {
+		m[xrpc.MethodAgentLogs] = func(ctx context.Context, raw json.RawMessage) (any, error) {
+			var p xrpc.AgentLogsParams
+			if len(raw) > 0 && string(raw) != "null" {
+				if err := decode(raw, &p); err != nil {
+					return nil, err
+				}
+			}
+			return d.Logs.List(ctx, p)
+		}
+		m[xrpc.MethodAgentLogFiles] = func(context.Context, json.RawMessage) (any, error) {
+			return d.Logs.Files()
+		}
+	}
+	return m
 }

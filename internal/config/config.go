@@ -24,6 +24,24 @@ import (
 // DefaultPath 是配置文件的默认位置。
 const DefaultPath = "/etc/satchel-agent/config.yaml"
 
+// DefaultStateLogPath 是默认系统配置路径对应的节点轮转日志路径。
+const DefaultStateLogPath = "/var/lib/satchel-agent/logs/satchel-agent.log"
+
+// EffectiveLogPath 返回配置生效的日志文件路径：优先配置里的 log_path，其次按配置位置决定默认路径。
+func EffectiveLogPath(configPath, configuredLogPath string) string {
+	if p := strings.TrimSpace(configuredLogPath); p != "" {
+		return p
+	}
+	if filepath.Clean(strings.TrimSpace(configPath)) == DefaultPath {
+		return DefaultStateLogPath
+	}
+	dir := filepath.Dir(strings.TrimSpace(configPath))
+	if dir == "" || dir == "." {
+		return filepath.Join("logs", "satchel-agent.log")
+	}
+	return filepath.Join(dir, "logs", "satchel-agent.log")
+}
+
 // 四种连接模式与节点入站默认端口。
 const (
 	ModeAuto      = "auto"
@@ -51,6 +69,7 @@ type Config struct {
 	ConnectionMode  string `yaml:"connection_mode"`
 	ListenPort      int    `yaml:"listen_port,omitempty"`
 	PullPort        int    `yaml:"pull_port,omitempty"`
+	LogPath         string `yaml:"log_path,omitempty"`
 }
 
 // EffectiveListenPort 返回生效的管理监听端口（未配置时取默认 23889）。
@@ -79,6 +98,7 @@ func (c *Config) Validate() error {
 		"pull_token":        c.PullToken,
 		"master_public_key": c.MasterPublicKey,
 		"connection_mode":   c.ConnectionMode,
+		"log_path":          c.LogPath,
 	} {
 		if err := pathguard.RejectControlChars(field, val); err != nil {
 			return err
