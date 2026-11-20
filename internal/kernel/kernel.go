@@ -105,6 +105,33 @@ func (k *Kernel) startLocked(ctx context.Context, config []byte) error {
 	return nil
 }
 
+// Validate 在不绑定端口、不写日志、不干扰当前运行内核的前提下执行与 sing-box check 一致的完整静态校验：
+// 使用独立 include.Context 解析扩展 JSON（拦截未知字段与语法错误），并构造 box.New（校验重复 tag、路由引用与磁盘 TLS 证书，
+// 但不调用 PreStart / Start），完成后立即释放实例资源。成功时返回非 nil 的入站 tag 列表。
+func Validate(config []byte) ([]string, error) {
+	boxCtx, cancel := context.WithCancel(include.Context(context.Background()))
+	defer cancel()
+	options, err := json.UnmarshalExtendedContext[option.Options](boxCtx, config)
+	if err != nil {
+		return nil, err
+	}
+	instance, err := box.New(box.Options{Context: boxCtx, Options: options})
+	if err != nil {
+		return nil, err
+	}
+	_ = instance.Close()
+	if lf := instance.LogFactory(); lf != nil {
+		_ = lf.Close()
+	}
+	tags := []string{}
+	for _, in := range options.Inbounds {
+		if in.Tag != "" {
+			tags = append(tags, in.Tag)
+		}
+	}
+	return tags, nil
+}
+
 // InboundTags 从一份 sing-box 配置里取入站名（inbounds[].tag，没写 tag 的跳过），解析规则与 Start 相同（sing 的扩展 JSON，
 // 允许注释等）。解析不了时返回错误；配置里一个入站都没有时返回空切片（不是 nil）。
 func InboundTags(config []byte) ([]string, error) {

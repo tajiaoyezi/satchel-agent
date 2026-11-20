@@ -77,17 +77,19 @@ func (in *Inbounds) Set(tags []string) {
 // Deps 是这些方法的依赖。Inbounds 存 kernel.json 里的入站名；KernelCtx 是内核启动用的 context（随进程退出取消，
 // 不随通道连接取消）；ConfigDir 是放 kernel.json 的目录。Now 为空时用 time.Now。
 type Deps struct {
-	Limits    *limits.Store
-	Tracker   *tracker.Tracker
-	Kernel    *kernel.Kernel
-	Inbounds  *Inbounds
-	KernelCtx context.Context
-	ConfigDir string
-	Now       func() time.Time
-	Sys       *telemetry.SysCollector
-	Speed     *telemetry.SpeedCollector
-	Logs      *telemetry.LogInspector
-	ListNICs  func() ([]xrpc.NICInfo, error)
+	Limits     *limits.Store
+	Tracker    *tracker.Tracker
+	Kernel     *kernel.Kernel
+	Inbounds   *Inbounds
+	KernelCtx  context.Context
+	ConfigDir  string
+	NginxRoots []string
+	ConfigMu   *sync.Mutex
+	Now        func() time.Time
+	Sys        *telemetry.SysCollector
+	Speed      *telemetry.SpeedCollector
+	Logs       *telemetry.LogInspector
+	ListNICs   func() ([]xrpc.NICInfo, error)
 }
 
 func badParams(format string, args ...any) *xrpc.Error {
@@ -153,6 +155,9 @@ func checkSource(source string) error {
 func Methods(d Deps) xrpc.Methods {
 	if d.Inbounds == nil {
 		d.Inbounds = NewInbounds(nil)
+	}
+	if d.ConfigMu == nil {
+		d.ConfigMu = &sync.Mutex{}
 	}
 	m := xrpc.Methods{
 		xrpc.MethodLimiterSet: func(_ context.Context, raw json.RawMessage) (any, error) {
@@ -256,6 +261,8 @@ func Methods(d Deps) xrpc.Methods {
 			return out, nil
 		},
 		xrpc.MethodKernelRestart: func(_ context.Context, _ json.RawMessage) (any, error) {
+			d.ConfigMu.Lock()
+			defer d.ConfigMu.Unlock()
 			config, tags, err := ReadKernelConfig(d.ConfigDir)
 			if err != nil {
 				return nil, badParams("%v", err)
@@ -275,6 +282,7 @@ func Methods(d Deps) xrpc.Methods {
 			return out, nil
 		},
 	}
+	registerConfigMethods(m, d)
 	if d.Sys != nil {
 		m[xrpc.MethodSystemInfo] = func(context.Context, json.RawMessage) (any, error) {
 			return d.Sys.Info(), nil
