@@ -283,6 +283,7 @@ func Methods(d Deps) xrpc.Methods {
 		},
 	}
 	registerConfigMethods(m, d)
+	registerOutboundMethods(m, d)
 	if d.Sys != nil {
 		m[xrpc.MethodSystemInfo] = func(context.Context, json.RawMessage) (any, error) {
 			return d.Sys.Info(), nil

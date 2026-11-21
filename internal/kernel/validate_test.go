@@ -60,7 +60,21 @@ func TestValidateNonDisruptiveAndChecks(t *testing.T) {
 		t.Fatal("缺失磁盘 TLS 证书应被拒绝")
 	}
 
-	// 6. 校验全部结束后原有客户端连接依旧畅通无阻。
+	// 6. VLESS + Reality 入站依赖 with_utls 编译标签，校验应当通过（防止发布构件遗漏 with_utls）。
+	realityCfg := []byte(`{
+		"log":{"level":"warn"},
+		"inbounds":[{
+			"type":"vless","tag":"vless-reality","listen":"127.0.0.1","listen_port":19004,
+			"users":[{"name":"u1","uuid":"6a4f1c2e-3b5d-4e7f-8a9b-0c1d2e3f4a5b","flow":"xtls-rprx-vision"}],
+			"tls":{"enabled":true,"server_name":"www.microsoft.com","reality":{"enabled":true,"handshake":{"server":"www.microsoft.com","server_port":443},"private_key":"eE5vQ2h1bmtLZXlGb3JUZXN0VGVzdFRlc3RUZXN0VEE","short_id":["1a2b3c4d"]}}
+		}],
+		"outbounds":[{"type":"direct","tag":"direct"}]
+	}`)
+	if rTags, err := kernel.Validate(realityCfg); err != nil || len(rTags) != 1 || rTags[0] != "vless-reality" {
+		t.Fatalf("VLESS + Reality 配置校验应当通过（需带 -tags with_quic,with_utls）：tags=%v err=%v", rTags, err)
+	}
+
+	// 7. 校验全部结束后原有客户端连接依旧畅通无阻。
 	kt.Echo(t, c, 1)
 	kt.EchoUDP(t, c, 2)
 }

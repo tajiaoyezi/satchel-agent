@@ -19,7 +19,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build \
     -trimpath \
-    -tags with_quic \
+    -tags with_quic,with_utls \
     -ldflags="-s -w -X github.com/satchel/satchel-agent/internal/buildinfo.Version=${VERSION} -X github.com/satchel/satchel-agent/internal/buildinfo.Commit=${COMMIT} -X github.com/satchel/satchel-agent/internal/buildinfo.Date=${DATE}" \
     -o /out/satchel-agent ./cmd/satchel-agent
 

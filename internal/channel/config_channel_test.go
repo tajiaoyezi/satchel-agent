@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -125,5 +126,25 @@ func TestPullPortRejectsAllConfigMethodsAndManagePortAccepts(t *testing.T) {
 	mStatus, mReply, err := callNodeRPC(t, priv, manageBase, "tok-agent", manageSID, manageSess, xrpc.MethodConfigStatus, nil)
 	if err != nil || mStatus != http.StatusOK || mReply.Error != nil || json.Unmarshal(mReply.Result, &st) != nil || !st.Exists || st.Hash == "" {
 		t.Fatalf("listen_port config.status 返回不对：status=%d err=%v reply=%s rerr=%+v", mStatus, err, mReply.Result, mReply.Error)
+	}
+
+	// node-channel「轮询只读口拒绝 outbound.probe」：pull_port 返回 unknown_method，listen_port 正常执行真实内核出站探活。
+	if err := k.Start(context.Background(), []byte(validCfg)); err != nil {
+		t.Fatalf("启动测试内核失败：%v", err)
+	}
+	probeTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer probeTarget.Close()
+
+	probeParams := xrpc.OutboundProbeParams{Tag: "direct", URL: probeTarget.URL, TimeoutMS: 5000}
+	pStatus, pReply, err := callNodeRPC(t, priv, pullBase, "tok-pull", pullSID, pullSess, xrpc.MethodOutboundProbe, probeParams)
+	if err != nil || pStatus != http.StatusOK || pReply.Error == nil || pReply.Error.Code != xrpc.CodeUnknownMethod {
+		t.Fatalf("pull_port 应对 outbound.probe 返回 unknown_method，得到 status=%d err=%v replyErr=%+v", pStatus, err, pReply.Error)
+	}
+	mStatus, mReply, err = callNodeRPC(t, priv, manageBase, "tok-agent", manageSID, manageSess, xrpc.MethodOutboundProbe, probeParams)
+	var pr xrpc.OutboundProbeResult
+	if err != nil || mStatus != http.StatusOK || mReply.Error != nil || json.Unmarshal(mReply.Result, &pr) != nil || !pr.OK || pr.StatusCode != http.StatusNoContent {
+		t.Fatalf("listen_port 应正常受理 outbound.probe，得到 status=%d err=%v reply=%s rerr=%+v", mStatus, err, mReply.Result, mReply.Error)
 	}
 }
