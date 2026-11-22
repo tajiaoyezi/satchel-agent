@@ -19,9 +19,11 @@ import (
 
 	"github.com/satchel/satchel-agent/internal/kernel"
 	"github.com/satchel/satchel-agent/internal/limits"
+	"github.com/satchel/satchel-agent/internal/netprobe"
 	"github.com/satchel/satchel-agent/internal/nginxctl"
 	"github.com/satchel/satchel-agent/internal/telemetry"
 	"github.com/satchel/satchel-agent/internal/tracker"
+	"github.com/satchel/satchel-agent/internal/warpctl"
 )
 
 // KernelConfig 是内核配置（一份 sing-box 配置）的文件名，与 config.yaml 放在同一个目录。
@@ -78,23 +80,26 @@ func (in *Inbounds) Set(tags []string) {
 // Deps 是这些方法的依赖。Inbounds 存 kernel.json 里的入站名；KernelCtx 是内核启动用的 context（随进程退出取消，
 // 不随通道连接取消）；ConfigDir 是放 kernel.json 的目录。Now 为空时用 time.Now。
 type Deps struct {
-	Limits       *limits.Store
-	Tracker      *tracker.Tracker
-	Kernel       *kernel.Kernel
-	Inbounds     *Inbounds
-	KernelCtx    context.Context
-	ConfigDir    string
-	NginxRoots   []string
-	Nginx        *nginxctl.Controller
-	AgentVersion string
-	StartedAt    time.Time
-	InDocker     func() bool
-	ConfigMu     *sync.Mutex
-	Now          func() time.Time
-	Sys          *telemetry.SysCollector
-	Speed        *telemetry.SpeedCollector
-	Logs         *telemetry.LogInspector
-	ListNICs     func() ([]xrpc.NICInfo, error)
+	Limits           *limits.Store
+	Tracker          *tracker.Tracker
+	Kernel           *kernel.Kernel
+	Inbounds         *Inbounds
+	KernelCtx        context.Context
+	ConfigDir        string
+	NginxRoots       []string
+	Nginx            *nginxctl.Controller
+	Warp             *warpctl.Manager
+	Tracer           netprobe.Tracer
+	ValidateSiteOpts *netprobe.ValidateSiteOptions
+	AgentVersion     string
+	StartedAt        time.Time
+	InDocker         func() bool
+	ConfigMu         *sync.Mutex
+	Now              func() time.Time
+	Sys              *telemetry.SysCollector
+	Speed            *telemetry.SpeedCollector
+	Logs             *telemetry.LogInspector
+	ListNICs         func() ([]xrpc.NICInfo, error)
 }
 
 func badParams(format string, args ...any) *xrpc.Error {
@@ -290,6 +295,8 @@ func Methods(d Deps) xrpc.Methods {
 	registerConfigMethods(m, d)
 	registerOutboundMethods(m, d)
 	registerNginxAndServiceMethods(m, d)
+	registerNetworkMethods(m, d)
+	registerWarpMethods(m, d)
 	if d.Sys != nil {
 		m[xrpc.MethodSystemInfo] = func(context.Context, json.RawMessage) (any, error) {
 			return d.Sys.Info(), nil

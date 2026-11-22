@@ -42,17 +42,17 @@ go build ./cmd/satchel-agent
 
 ## 内核的编译标签
 
-内核是以 Go module 依赖引用的官方 sing-box（版本钉在 `go.mod`，不 fork、不加 `replace`）。sing-box 的 Hysteria2 / TUIC 依赖 QUIC（`with_quic`），VLESS / Trojan Reality 服务端与客户端依赖 uTLS（`with_utls`）；缺标签启动会报 `QUIC is not included` 或 `uTLS, which is required by reality is not included`。所以 vet、build、test 都带上这两个标签：
+内核是以 Go module 依赖引用的官方 sing-box（版本钉在 `go.mod`，不 fork、不加 `replace`）。sing-box 的 Hysteria2 / TUIC 依赖 QUIC（`with_quic`），VLESS / Trojan Reality 服务端与客户端依赖 uTLS（`with_utls`），WARP 用户态 WireGuard 端点依赖 `with_wireguard` 与 `with_gvisor`；缺标签启动会报对应特性未编入错误。所以 vet、build、test 都带上这四个标签：
 
 ```sh
-go vet -tags with_quic,with_utls ./...
-go test -tags with_quic,with_utls ./...
+go vet -tags with_quic,with_utls,with_wireguard,with_gvisor ./...
+go test -tags with_quic,with_utls,with_wireguard,with_gvisor ./...
 ```
 
 `internal/kernel` 里有 M2 证伪点的五项测试（按凭据限速、识别连接、踢线、三维计数、重启基线，测试名都以 `TestFalsification` 开头）；起停测试内核、客户端、收发流量服务与本地转发的工具放在 `pkg/kerneltest`，主控仓库 `test/acceptance` 的正式验收也引用它。默认跑快速版：时间窗与数据量都缩小，只查行为对不对。结论以完整版为准，完整版多带一个标签 `falsification`：
 
 ```sh
-go test -tags with_quic,with_utls,falsification -run Falsification -timeout 30m -v ./...
+go test -tags with_quic,with_utls,with_wireguard,with_gvisor,falsification -run Falsification -timeout 30m -v ./...
 ```
 
 测得的数字以「结果」开头打在 `-v` 的输出里。CI 在推送到 main 与手动触发时跑完整版（`.github/workflows/ci.yml` 的 `falsification` job），不挡普通提交的检查。

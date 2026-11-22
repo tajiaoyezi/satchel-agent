@@ -33,6 +33,7 @@ import (
 	"github.com/satchel/satchel-agent/internal/telemetry"
 	"github.com/satchel/satchel-agent/internal/tracker"
 	"github.com/satchel/satchel-agent/internal/updater"
+	"github.com/satchel/satchel-agent/internal/warpctl"
 )
 
 // kernelConfig 是内核配置（一份 sing-box 配置）的文件名，与 config.yaml 放在同一个目录；改了执行 server restart-kernel 或重启 satchel-agent 生效。
@@ -246,6 +247,7 @@ func runAgentWithLogs(ctx context.Context, dir string, cfg channel.Config, logge
 	deps.StartedAt = time.Now().UTC()
 	deps.InDocker = func() bool { return release.InDocker("/") }
 	deps.Nginx = nginxctl.New(nginxctl.Options{InDocker: deps.InDocker})
+	deps.Warp = warpctl.New(dir)
 	cfg.Methods = control.Methods(deps)
 	if cfg.SpeedCollector == nil {
 		cfg.SpeedCollector = speedCol
