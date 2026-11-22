@@ -29,6 +29,7 @@ import (
 	"github.com/satchel/satchel-agent/internal/kernel"
 	"github.com/satchel/satchel-agent/internal/limits"
 	"github.com/satchel/satchel-agent/internal/logging"
+	"github.com/satchel/satchel-agent/internal/nginxctl"
 	"github.com/satchel/satchel-agent/internal/telemetry"
 	"github.com/satchel/satchel-agent/internal/tracker"
 	"github.com/satchel/satchel-agent/internal/updater"
@@ -241,6 +242,10 @@ func runAgentWithLogs(ctx context.Context, dir string, cfg channel.Config, logge
 	deps.Speed = speedCol
 	deps.Logs = logInsp
 	deps.ListNICs = telemetry.ListNICs
+	deps.AgentVersion = cfg.AgentVersion
+	deps.StartedAt = time.Now().UTC()
+	deps.InDocker = func() bool { return release.InDocker("/") }
+	deps.Nginx = nginxctl.New(nginxctl.Options{InDocker: deps.InDocker})
 	cfg.Methods = control.Methods(deps)
 	if cfg.SpeedCollector == nil {
 		cfg.SpeedCollector = speedCol
