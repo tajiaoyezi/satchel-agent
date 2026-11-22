@@ -135,6 +135,15 @@ func (d Deps) handleConfigApply(p xrpc.ConfigApplyParams) (xrpc.ConfigApplyResul
 		return xrpc.ConfigApplyResult{}, badParams("节点未配置配置目录")
 	}
 	candidate := []byte(p.Config)
+	// 同机 443 内核防抢占守卫：只要主控要求保护或节点磁盘检测到主控 443 标记，拒绝含 listen_port == 443 的候选配置。
+	if p.ProtectMaster443 || HasMaster443Marker(d.nginxRoots()) {
+		if has443, tags443, perr := ConfigHasPort443Inbound(candidate); perr == nil && has443 {
+			return xrpc.ConfigApplyResult{}, &xrpc.Error{
+				Code:    xrpc.CodeConflict,
+				Message: fmt.Sprintf("主控同机 443 防抢占守卫生效，拒绝应用含 443 端口入站（%s）的配置", strings.Join(tags443, ", ")),
+			}
+		}
+	}
 	// 先在锁外执行无侵入校验：配置非法直接拒绝，不触碰磁盘与运行中内核。
 	newTags, err := kernel.Validate(candidate)
 	if err != nil {

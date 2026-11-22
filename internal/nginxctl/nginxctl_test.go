@@ -252,3 +252,118 @@ func TestNginxCtlClearStreamProtectionAndRollback(t *testing.T) {
 		t.Fatalf("unmanaged custom-8443.conf must NEVER be deleted")
 	}
 }
+
+func TestNginxCtlApplyWebsitesStealSiteTxAndGuards(t *testing.T) {
+	root := t.TempDir()
+	serversDir := filepath.Join(root, "servers")
+	if err := os.MkdirAll(serversDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	failTest := false
+	r := &fakeRunner{
+		bins: map[string]string{"nginx": "/usr/sbin/nginx"},
+		runFn: func(name string, args ...string) (string, error) {
+			if name == "nginx" && len(args) > 0 && args[len(args)-1] == "-t" && failTest {
+				return "nginx: [emerg] broken steal conf", errors.New("exit status 1")
+			}
+			return "ok", nil
+		},
+	}
+	ctl := New(Options{
+		RootDir:      root,
+		InDocker:     func() bool { return false },
+		Runner:       r,
+		CheckRunning: func(context.Context, string) bool { return true },
+	})
+
+	// 1. steal_site 与 remove_steal 互斥拦截
+	_, err := ctl.ApplyWebsites(context.Background(), xrpc.NginxWebsitesApplyParams{
+		StealSite:   &xrpc.ManagedWebsiteFile{Domain: "decoy.example.com", Conf: xrpc.SatchelManagedHeader + " steal\nserver { listen 127.0.0.1:8001 ssl; }\n"},
+		RemoveSteal: true,
+	})
+	var xe *xrpc.Error
+	if !errors.As(err, &xe) || xe.Code != xrpc.CodeBadParams {
+		t.Fatalf("互斥参数应报 bad_params，得到：%v", err)
+	}
+
+	// 2. 同机 443 守卫拦截含 listen 443 的 steal_site
+	_, err = ctl.ApplyWebsites(context.Background(), xrpc.NginxWebsitesApplyParams{
+		ProtectMaster443: true,
+		StealSite: &xrpc.ManagedWebsiteFile{
+			Domain: "decoy.example.com",
+			Conf:   xrpc.SatchelManagedHeader + " steal\nserver {\n    listen 443 ssl;\n}\n",
+		},
+	})
+	if !errors.As(err, &xe) || xe.Code != xrpc.CodeConflict {
+		t.Fatalf("同机 443 守卫应拦截 listen 443 的 steal_site，得到：%v", err)
+	}
+
+	// 3. 合法 steal_site 原子落盘并重载（含默认 decoy index.html），且不出现在 ScanWebsites 中
+	origStealConf := xrpc.SatchelManagedHeader + " steal_self=true domain=decoy.example.com\nserver {\n    listen 127.0.0.1:8001 ssl;\n    server_name decoy.example.com;\n}\n"
+	res, err := ctl.ApplyWebsites(context.Background(), xrpc.NginxWebsitesApplyParams{
+		StealSite: &xrpc.ManagedWebsiteFile{
+			Domain:      "decoy.example.com",
+			Conf:        origStealConf,
+			HTMLPath:    "/etc/nginx/html/decoy.example.com/index.html",
+			HTMLContent: "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Decoy</title></head><body>ok</body></html>\n",
+		},
+	})
+	if err != nil || !res.Reloaded || !res.StealApplied || res.StealRemoved || res.StealConfPath != filepath.Join(serversDir, ManagedStealFile) {
+		t.Fatalf("steal_site 应用结果异常：res=%+v err=%v", res, err)
+	}
+	if scan, serr := ctl.ScanWebsites(); serr != nil || len(scan.Sites) != 0 {
+		t.Fatalf("ScanWebsites 应忽略 satchel-steal.conf，得到：%+v err=%v", scan.Sites, serr)
+	}
+	if srvList, lerr := ctl.ListServers(); lerr != nil || len(srvList.Servers) != 1 || !srvList.Servers[0].Managed {
+		t.Fatalf("ListServers 应能看到受管的 satchel-steal.conf，得到：%+v err=%v", srvList.Servers, lerr)
+	}
+
+	// 4. 更新 steal_site 时 nginx -t 失败 -> 完整回滚至原内容
+	failTest = true
+	rbRes, err := ctl.ApplyWebsites(context.Background(), xrpc.NginxWebsitesApplyParams{
+		StealSite: &xrpc.ManagedWebsiteFile{
+			Domain: "decoy.example.com",
+			Conf:   xrpc.SatchelManagedHeader + " broken\nserver { invalid }\n",
+		},
+	})
+	if err != nil || !rbRes.RolledBack || rbRes.StealApplied || rbRes.Error == "" {
+		t.Fatalf("nginx -t 失败应回滚：res=%+v err=%v", rbRes, err)
+	}
+	afterRB, _ := os.ReadFile(filepath.Join(serversDir, ManagedStealFile))
+	if string(afterRB) != origStealConf {
+		t.Fatalf("satchel-steal.conf 未完整回滚：\n%s", afterRB)
+	}
+
+	// 5. remove_steal 原子删除并支持幂等二次调用
+	failTest = false
+	remRes, err := ctl.ApplyWebsites(context.Background(), xrpc.NginxWebsitesApplyParams{
+		RemoveSteal: true,
+	})
+	if err != nil || !remRes.Reloaded || !remRes.StealRemoved || remRes.StealApplied {
+		t.Fatalf("remove_steal 应成功删除：res=%+v err=%v", remRes, err)
+	}
+	if _, serr := os.Stat(filepath.Join(serversDir, ManagedStealFile)); !errors.Is(serr, os.ErrNotExist) {
+		t.Fatalf("satchel-steal.conf 应已删除，err=%v", serr)
+	}
+	remRes2, err := ctl.ApplyWebsites(context.Background(), xrpc.NginxWebsitesApplyParams{
+		RemoveSteal: true,
+	})
+	if err != nil || remRes2.StealRemoved {
+		t.Fatalf("二次 remove_steal 应幂等成功且 StealRemoved=false：res=%+v err=%v", remRes2, err)
+	}
+
+	// 6. 磁盘上若存在手工未纳管的 satchel-steal.conf，覆盖与删除均报 conflict
+	if err := os.WriteFile(filepath.Join(serversDir, ManagedStealFile), []byte("server { listen 8001; }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ctl.ApplyWebsites(context.Background(), xrpc.NginxWebsitesApplyParams{
+		StealSite: &xrpc.ManagedWebsiteFile{Domain: "decoy.example.com", Conf: origStealConf},
+	}); !errors.As(err, &xe) || xe.Code != xrpc.CodeConflict {
+		t.Fatalf("未纳管 satchel-steal.conf 应拒绝覆盖，得到：%v", err)
+	}
+	if _, err := ctl.ApplyWebsites(context.Background(), xrpc.NginxWebsitesApplyParams{
+		RemoveSteal: true,
+	}); !errors.As(err, &xe) || xe.Code != xrpc.CodeConflict {
+		t.Fatalf("未纳管 satchel-steal.conf 应拒绝删除，得到：%v", err)
+	}
+}

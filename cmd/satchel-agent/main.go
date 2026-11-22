@@ -404,6 +404,14 @@ func startKernelWithLogWriter(ctx context.Context, dir string, logger *slog.Logg
 	}
 	inbounds := control.NewInbounds(nil)
 	deps := control.Deps{Limits: store, Tracker: tr, Kernel: k, Inbounds: inbounds, KernelCtx: ctx, ConfigDir: dir}
+	if dir != "" {
+		if modified, backupPath, removedTags, perr := control.ProtectMasterHTTPSPort443(filepath.Join(dir, kernelConfig), nil); perr != nil {
+			logger.Warn("主控同机 443 启动自愈检查出错", "err", perr)
+		} else if modified {
+			logger.Warn("检测到主控 443 保护标记，已自动剥离 kernel.json 中的 443 入站并留存备份",
+				"backup", backupPath, "removed_inbounds", removedTags)
+		}
+	}
 	config, tags, err := control.ReadKernelConfig(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {

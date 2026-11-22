@@ -119,7 +119,7 @@ func (c *Controller) ScanWebsites() (xrpc.NginxWebsitesScanResult, error) {
 	}
 	sites := make([]xrpc.ScannedWebsite, 0)
 	for _, b := range all.Servers {
-		if b.Kind != "http" {
+		if b.Kind != "http" || filepath.Base(b.ConfPath) == ManagedStealFile {
 			continue
 		}
 		typ := "unknown"

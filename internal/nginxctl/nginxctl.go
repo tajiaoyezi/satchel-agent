@@ -27,6 +27,7 @@ import (
 const (
 	DefaultRootDir     = "/etc/nginx"
 	ManagedSitePrefix  = "satchel-site-"
+	ManagedStealFile   = "satchel-steal.conf"
 	MasterHTTPS443File = "master_https_443.conf"
 	initSystemSystemd  = "systemd"
 	initSystemOpenRC   = "openrc"
@@ -803,8 +804,15 @@ func (c *Controller) ClearStream(ctx context.Context, params xrpc.NginxClearStre
 	}, nil
 }
 
-// ApplyWebsites 原子落盘主控下发的受管站点配置与移除列表，执行三重守卫、nginx -t 校验与重载，失败自动回滚。
+// ApplyWebsites 原子落盘主控下发的受管站点配置、移除列表以及可选的偷自己配置，执行三重守卫、nginx -t 校验与重载，失败自动回滚。
 func (c *Controller) ApplyWebsites(ctx context.Context, params xrpc.NginxWebsitesApplyParams) (xrpc.NginxWebsitesApplyResult, error) {
+	if params.StealSite != nil && params.RemoveSteal {
+		return xrpc.NginxWebsitesApplyResult{}, &xrpc.Error{
+			Code:    xrpc.CodeBadParams,
+			Message: "steal_site 与 remove_steal 互斥，不能同时设置",
+		}
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -828,7 +836,7 @@ func (c *Controller) ApplyWebsites(ctx context.Context, params xrpc.NginxWebsite
 	}
 	ops := make([]writeOp, 0, len(params.Sites))
 	keepConfPaths := map[string]bool{}
-	snapshots := make([]fileSnapshot, 0, len(params.Sites)*2+len(params.RemoveDomains))
+	snapshots := make([]fileSnapshot, 0, len(params.Sites)*2+len(params.RemoveDomains)+2)
 	snapSeen := map[string]bool{}
 
 	recordSnap := func(target string) error {
@@ -955,6 +963,85 @@ func (c *Controller) ApplyWebsites(ctx context.Context, params xrpc.NginxWebsite
 		removals = append(removals, removeOp{domain: dom, confPath: confPath})
 	}
 
+	// 2.5 预检偷自己配置文件（固定 satchel-steal.conf，与常规站点共享同一快照与回滚事务）。
+	var stealWrite *writeOp
+	var stealRemovePath string
+	if params.StealSite != nil {
+		if !HasManagedHeader(params.StealSite.Conf) {
+			return xrpc.NginxWebsitesApplyResult{}, &xrpc.Error{
+				Code:    xrpc.CodeBadParams,
+				Message: fmt.Sprintf("偷自己配置缺少 %s 标记", xrpc.SatchelManagedHeader),
+			}
+		}
+		if protect443 && HasPort443Listen(params.StealSite.Conf) {
+			return xrpc.NginxWebsitesApplyResult{}, &xrpc.Error{
+				Code:    xrpc.CodeConflict,
+				Message: "同机 443 防抢占守卫生效，拒绝写入监听 443 端口的偷自己配置",
+			}
+		}
+		stealPath := filepath.Join(serversDir, ManagedStealFile)
+		if _, err := pathguard.PathWithinDirs(stealPath, serversDir); err != nil {
+			return xrpc.NginxWebsitesApplyResult{}, &xrpc.Error{Code: xrpc.CodeBadParams, Message: "偷自己配置路径越界：" + err.Error()}
+		}
+		if existing, err := os.ReadFile(stealPath); err == nil {
+			if !HasManagedHeader(string(existing)) {
+				return xrpc.NginxWebsitesApplyResult{}, &xrpc.Error{
+					Code:    xrpc.CodeConflict,
+					Message: fmt.Sprintf("拒绝覆盖未纳管的 nginx 配置文件 %s（缺少 %s 标记）", stealPath, xrpc.SatchelManagedHeader),
+				}
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return xrpc.NginxWebsitesApplyResult{}, fmt.Errorf("读取 %s 失败：%w", stealPath, err)
+		}
+		if err := recordSnap(stealPath); err != nil {
+			return xrpc.NginxWebsitesApplyResult{}, err
+		}
+		var mappedHTML string
+		var htmlData []byte
+		if strings.TrimSpace(params.StealSite.HTMLPath) != "" && params.StealSite.HTMLContent != "" {
+			mappedHTML = c.remapHTMLPath(params.StealSite.HTMLPath)
+			if _, err := pathguard.PathWithinDirs(mappedHTML, htmlDir); err != nil {
+				return xrpc.NginxWebsitesApplyResult{}, &xrpc.Error{Code: xrpc.CodeBadParams, Message: "偷自己伪装页路径越界：" + err.Error()}
+			}
+			if existingHTML, err := os.ReadFile(mappedHTML); errors.Is(err, os.ErrNotExist) ||
+				(err == nil && strings.HasPrefix(string(existingHTML), "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>")) {
+				if err := recordSnap(mappedHTML); err != nil {
+					return xrpc.NginxWebsitesApplyResult{}, err
+				}
+				htmlData = []byte(params.StealSite.HTMLContent)
+			} else {
+				mappedHTML = ""
+			}
+		}
+		stealWrite = &writeOp{
+			domain:   strings.ToLower(strings.TrimSpace(params.StealSite.Domain)),
+			confPath: stealPath,
+			conf:     []byte(c.remapConfRootDir(params.StealSite.Conf)),
+			htmlPath: mappedHTML,
+			html:     htmlData,
+		}
+	} else if params.RemoveSteal {
+		stealPath := filepath.Join(serversDir, ManagedStealFile)
+		if _, err := pathguard.PathWithinDirs(stealPath, serversDir); err != nil {
+			return xrpc.NginxWebsitesApplyResult{}, &xrpc.Error{Code: xrpc.CodeBadParams, Message: "待删除偷自己配置路径越界：" + err.Error()}
+		}
+		existing, err := os.ReadFile(stealPath)
+		if err == nil {
+			if !HasManagedHeader(string(existing)) {
+				return xrpc.NginxWebsitesApplyResult{}, &xrpc.Error{
+					Code:    xrpc.CodeConflict,
+					Message: fmt.Sprintf("拒绝删除未纳管的 nginx 配置文件 %s（缺少 %s 标记）", stealPath, xrpc.SatchelManagedHeader),
+				}
+			}
+			if err := recordSnap(stealPath); err != nil {
+				return xrpc.NginxWebsitesApplyResult{}, err
+			}
+			stealRemovePath = stealPath
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return xrpc.NginxWebsitesApplyResult{}, fmt.Errorf("检查待删除偷自己配置 %s 失败：%w", stealPath, err)
+		}
+	}
+
 	// 3. 原子落盘全部文件与删除。
 	appliedFiles := make([]xrpc.AppliedWebsiteFile, 0, len(ops))
 	for _, op := range ops {
@@ -999,6 +1086,42 @@ func (c *Controller) ApplyWebsites(ctx context.Context, params xrpc.NginxWebsite
 		}
 		removedDomains = append(removedDomains, rem.domain)
 	}
+	if stealWrite != nil {
+		if stealWrite.htmlPath != "" && len(stealWrite.html) > 0 {
+			if err := atomicWriteFile(stealWrite.htmlPath, stealWrite.html, 0o644); err != nil {
+				rbErr := restoreSnapshots(snapshots)
+				return xrpc.NginxWebsitesApplyResult{
+					Applied:       []xrpc.AppliedWebsiteFile{},
+					Removed:       []string{},
+					RolledBack:    rbErr == "",
+					RollbackError: rbErr,
+					Error:         "写入偷自己伪装页失败：" + err.Error(),
+				}, nil
+			}
+		}
+		if err := atomicWriteFile(stealWrite.confPath, stealWrite.conf, 0o644); err != nil {
+			rbErr := restoreSnapshots(snapshots)
+			return xrpc.NginxWebsitesApplyResult{
+				Applied:       []xrpc.AppliedWebsiteFile{},
+				Removed:       []string{},
+				RolledBack:    rbErr == "",
+				RollbackError: rbErr,
+				Error:         "写入偷自己配置失败：" + err.Error(),
+			}, nil
+		}
+	}
+	if stealRemovePath != "" {
+		if err := os.Remove(stealRemovePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			rbErr := restoreSnapshots(snapshots)
+			return xrpc.NginxWebsitesApplyResult{
+				Applied:       []xrpc.AppliedWebsiteFile{},
+				Removed:       []string{},
+				RolledBack:    rbErr == "",
+				RollbackError: rbErr,
+				Error:         "删除偷自己配置失败：" + err.Error(),
+			}, nil
+		}
+	}
 
 	// 4. nginx -t 校验并在运行中时平滑重载；任一步失败全量回滚。
 	reloaded, txErr := c.testAndReload(ctx)
@@ -1016,11 +1139,19 @@ func (c *Controller) ApplyWebsites(ctx context.Context, params xrpc.NginxWebsite
 
 	sort.Slice(appliedFiles, func(i, j int) bool { return appliedFiles[i].Domain < appliedFiles[j].Domain })
 	sort.Strings(removedDomains)
-	return xrpc.NginxWebsitesApplyResult{
+	res := xrpc.NginxWebsitesApplyResult{
 		Applied:  appliedFiles,
 		Removed:  removedDomains,
 		Reloaded: reloaded,
-	}, nil
+	}
+	if stealWrite != nil {
+		res.StealApplied = true
+		res.StealConfPath = stealWrite.confPath
+	} else if stealRemovePath != "" {
+		res.StealRemoved = true
+		res.StealConfPath = stealRemovePath
+	}
+	return res, nil
 }
 
 func (c *Controller) remapHTMLPath(raw string) string {

@@ -46,11 +46,11 @@ model name	: AMD EPYC 7763
 physical id	: 0
 core id		: 1
 `,
-		"/proc/uptime":                     "12345.67 45678.90\n",
-		"/proc/loadavg":                    "0.42 0.35 0.28 1/200 1234\n",
-		"/etc/os-release":                  "NAME=\"Debian GNU/Linux\"\nPRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\n",
-		"/proc/sys/kernel/osrelease":       "6.1.0-20-amd64\n",
-		"/proc/sys/net/ipv4/tcp_fastopen":  "3\n",
+		"/proc/uptime":                    "12345.67 45678.90\n",
+		"/proc/loadavg":                   "0.42 0.35 0.28 1/200 1234\n",
+		"/etc/os-release":                 "NAME=\"Debian GNU/Linux\"\nPRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\n",
+		"/proc/sys/kernel/osrelease":      "6.1.0-20-amd64\n",
+		"/proc/sys/net/ipv4/tcp_fastopen": "3\n",
 	}
 	readFile := func(p string) ([]byte, error) {
 		if p == "/proc/stat" {

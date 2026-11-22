@@ -78,23 +78,23 @@ type Config struct {
 	Sleep func(ctx context.Context, d time.Duration) error
 
 	// 以下为四模式与测试可注入参数，零值取生产默认常数。
-	StealthDelay          time.Duration
-	WSProbeInterval       time.Duration
-	HTTPFailLimit         int
-	PullWindowBase        time.Duration
-	PullWindowMax         time.Duration
-	HTTPHeartbeatInterval time.Duration
-	IPProbeInterval       time.Duration
-	IPProber              IPProber
-	Now                   func() time.Time
-	HTTPClient            *http.Client
-	SaveConfig            func(config.Config) error
-	Execs                 *updater.ExecCounter
-	RequestExec           func(exePath string)
-	RequestStop           func()
-	Root                  string
-	MachineID             string
-	StagingDir            string
+	StealthDelay           time.Duration
+	WSProbeInterval        time.Duration
+	HTTPFailLimit          int
+	PullWindowBase         time.Duration
+	PullWindowMax          time.Duration
+	HTTPHeartbeatInterval  time.Duration
+	IPProbeInterval        time.Duration
+	IPProber               IPProber
+	Now                    func() time.Time
+	HTTPClient             *http.Client
+	SaveConfig             func(config.Config) error
+	Execs                  *updater.ExecCounter
+	RequestExec            func(exePath string)
+	RequestStop            func()
+	Root                   string
+	MachineID              string
+	StagingDir             string
 	ReleaseSources         release.Sources
 	UpdateApply            func(context.Context, updater.Options) (*updater.Result, error)
 	UninstallSpawn         func(context.Context, updater.DetachOptions) (string, error)
