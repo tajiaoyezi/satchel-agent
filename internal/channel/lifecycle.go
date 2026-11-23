@@ -50,15 +50,21 @@ func (c *Client) setMasterURL(u string) {
 	c.masterMu.Unlock()
 }
 
-func (c *Client) setActiveWSCancel(cancel context.CancelFunc) {
+func (c *Client) setActiveWS(ctx context.Context, conn *xrpc.Conn, cancel context.CancelFunc) {
 	c.wsMu.Lock()
+	c.wsCtx = ctx
+	c.wsConn = conn
 	c.wsCancel = cancel
 	c.wsMu.Unlock()
 }
 
-func (c *Client) clearActiveWSCancel(_ context.CancelFunc) {
+func (c *Client) clearActiveWS(conn *xrpc.Conn) {
 	c.wsMu.Lock()
-	c.wsCancel = nil
+	if c.wsConn == conn {
+		c.wsCtx = nil
+		c.wsConn = nil
+		c.wsCancel = nil
+	}
 	c.wsMu.Unlock()
 }
 
@@ -71,6 +77,23 @@ func (c *Client) cancelActiveWS() {
 	}
 }
 
+// SendExecEvent 在当前存在已认证 WebSocket 连接时向主控单向上推 exec_event 增量输出或终态帧；
+// 若当前为 HTTP/pull 或短暂断连，静默返回 false（主控通过 exec.status 轮询或重连补报收拢）。
+func (c *Client) SendExecEvent(ev xrpc.ExecEvent) bool {
+	c.wsMu.Lock()
+	conn := c.wsConn
+	wsCtx := c.wsCtx
+	c.wsMu.Unlock()
+	if conn == nil || wsCtx == nil {
+		return false
+	}
+	if err := c.write(wsCtx, conn, xrpc.TypeExecEvent, ev); err != nil {
+		c.cfg.Logger.Debug("上推 exec_event 失败", "job_id", ev.JobID, "err", err)
+		return false
+	}
+	return true
+}
+
 func (c *Client) runtimeInfo() xrpc.AgentInfo {
 	return xrpc.AgentInfo{
 		AgentVersion:     c.cfg.AgentVersion,
@@ -80,6 +103,7 @@ func (c *Client) runtimeInfo() xrpc.AgentInfo {
 		MachineID:        c.machineID,
 		MasterURL:        c.getMasterURL(),
 		ExecRunning:      c.cfg.Execs != nil && c.cfg.Execs.Running(),
+		ExecEnabled:      c.cfg.AllowExec,
 	}
 }
 
@@ -112,6 +136,7 @@ func (c *Client) loadConfigForEditLocked() (config.Config, error) {
 		updated.ConnectionMode = c.cfg.Mode
 		updated.ListenPort = c.cfg.ListenPort
 		updated.PullPort = c.cfg.PullPort
+		updated.AllowExec = c.cfg.AllowExec
 		c.creds.FillConfig(&updated)
 	}
 	return updated, nil

@@ -81,4 +81,17 @@ func TestConfigModesPortsAndAtomicSave(t *testing.T) {
 	if _, err := Load(badYAML); err == nil {
 		t.Fatal("未知字段应当被 KnownFields(true) 拒绝")
 	}
+
+	// allow_exec 默认 false，显式设为 true 时正常往返。
+	execPath := filepath.Join(t.TempDir(), "exec.yaml")
+	cfgExec := Config{
+		MasterURL: "https://p.example.com", Token: "t", MasterPublicKey: key, ConnectionMode: ModeWebsocket, AllowExec: true,
+	}
+	if err := Save(execPath, cfgExec); err != nil {
+		t.Fatal(err)
+	}
+	loadedExec, err := Load(execPath)
+	if err != nil || !loadedExec.AllowExec {
+		t.Fatalf("allow_exec 往返异常：%+v err=%v", loadedExec, err)
+	}
 }

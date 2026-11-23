@@ -136,6 +136,7 @@ func (u *httpUplink) Call(ctx context.Context, method string, hb *xrpc.HTTPHeart
 			InDocker:         info.InDocker,
 			MachineID:        info.MachineID,
 			MasterURL:        info.MasterURL,
+			ExecEnabled:      info.ExecEnabled,
 			Heartbeat:        hb,
 			Traffic:          snap,
 			Speed:            speed,

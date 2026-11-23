@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -26,6 +27,8 @@ import (
 	"github.com/satchel/satchel-agent/internal/channel"
 	"github.com/satchel/satchel-agent/internal/config"
 	"github.com/satchel/satchel-agent/internal/control"
+	"github.com/satchel/satchel-agent/internal/diag"
+	"github.com/satchel/satchel-agent/internal/execctl"
 	"github.com/satchel/satchel-agent/internal/kernel"
 	"github.com/satchel/satchel-agent/internal/limits"
 	"github.com/satchel/satchel-agent/internal/logging"
@@ -41,14 +44,16 @@ const kernelConfig = control.KernelConfig
 
 const usage = `用法：
   satchel-agent join --master-url <url> --token <token> --master-key <key> --mode <mode>
-                     [--agent-token <token>] [--pull-token <token>] [--listen-port <port>] [--pull-port <port>] [--log-path <path>] [--config <path>]
+                     [--agent-token <token>] [--pull-token <token>] [--listen-port <port>] [--pull-port <port>] [--log-path <path>] [--allow-exec] [--config <path>]
   satchel-agent run [--config <path>] [--log-path <path>]
+  satchel-agent diag [item] [--config <path>] [--json]
   satchel-agent update [<version>] [--channel stable|prerelease] [--yes]
   satchel-agent uninstall [--yes] [--detach-delay <duration>]
   satchel-agent --version
 
   join       把主控地址、通信凭据、主控公钥、连接模式与入站端口写进配置文件（默认 ` + config.DefaultPath + `，权限 0600）
   run        按配置连主控并按模式开放受保护端口；配置目录里有 kernel.json 就照它起内核
+  diag       在本机直接执行固定只读诊断集（支持单项如 ports/services/logs/config/connectivity/firewall/clock/resources/certs/speedtest）
   update     纯 Go 下载验签、试跑并替换自身二进制（容器内禁用）
   uninstall  纯 Go 停止服务并清理二进制与白名单目录（容器内禁用）
 
@@ -67,6 +72,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return join(args[1:], stdout, stderr)
 		case "run":
 			return serve(args[1:], stderr)
+		case "diag":
+			return cmdDiag(args[1:], stdout, stderr)
 		case "update":
 			return cmdUpdate(args[1:], stdout, stderr)
 		case "uninstall":
@@ -115,6 +122,7 @@ func join(args []string, stdout, stderr io.Writer) int {
 	fs.IntVar(&c.ListenPort, "listen-port", 0, "节点管理监听端口（0 表示按默认 23889）")
 	fs.IntVar(&c.PullPort, "pull-port", 0, "节点只读轮询端口（0 表示按默认 23890）")
 	fs.StringVar(&c.LogPath, "log-path", "", "节点轮转日志文件路径（可选，默认 <state-dir>/logs/satchel-agent.log）")
+	fs.BoolVar(&c.AllowExec, "allow-exec", false, "在节点本机显式允许主控经 server exec 执行命令（默认关闭，仅可本机修改）")
 	path := fs.String("config", config.DefaultPath, "配置文件的位置")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -176,6 +184,7 @@ func serve(args []string, stderr io.Writer) int {
 		ListenPort:      c.EffectiveListenPort(),
 		PullPort:        c.EffectivePullPort(),
 		ConfigPath:      *path,
+		AllowExec:       c.AllowExec,
 		IPProbeInterval: channel.DefaultIPProbeInterval,
 		IPProber:        channel.DefaultIPProber,
 		AgentVersion:    buildinfo.Get().Version,
@@ -248,6 +257,38 @@ func runAgentWithLogs(ctx context.Context, dir string, cfg channel.Config, logge
 	deps.InDocker = func() bool { return release.InDocker("/") }
 	deps.Nginx = nginxctl.New(nginxctl.Options{InDocker: deps.InDocker})
 	deps.Warp = warpctl.New(dir)
+	deps.Diag = diag.New(diag.Options{
+		ConfigDir:    dir,
+		MasterURL:    cfg.MasterURL,
+		AgentVersion: cfg.AgentVersion,
+		StartedAt:    deps.StartedAt,
+		InDocker:     deps.InDocker,
+		KernelInfo: func() diag.KernelInfo {
+			ki := diag.KernelInfo{
+				Running:  k.Running(),
+				Inbounds: deps.Inbounds.Get(),
+			}
+			if ki.Running {
+				ki.Version = kernel.Version
+			}
+			if at := k.StartedAt(); !at.IsZero() {
+				ki.StartedAt = &at
+			}
+			return ki
+		},
+		Nginx: deps.Nginx,
+		Sys:   sysCol,
+		Logs:  logInsp,
+	})
+	execMgr := execctl.New(execctl.Options{
+		AllowExec:    cfg.AllowExec,
+		DataDir:      dir,
+		AuditLogPath: filepath.Join(logDir, "exec-audit.log"),
+		Execs:        cfg.Execs,
+		Logger:       logger,
+	})
+	defer execMgr.Shutdown()
+	deps.Exec = execMgr
 	cfg.Methods = control.Methods(deps)
 	if cfg.SpeedCollector == nil {
 		cfg.SpeedCollector = speedCol
@@ -255,7 +296,11 @@ func runAgentWithLogs(ctx context.Context, dir string, cfg channel.Config, logge
 	if cfg.SysCollector == nil {
 		cfg.SysCollector = sysCol
 	}
-	err := channel.New(cfg).Run(runCtx)
+	ch := channel.New(cfg)
+	execMgr.SetOnEvent(func(ev xrpc.ExecEvent) {
+		ch.SendExecEvent(ev)
+	})
+	err := ch.Run(runCtx)
 	cancelKernel()
 	logger.Info("已断开主控，停内核")
 	if serr := k.Stop(); serr != nil {
@@ -384,6 +429,95 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintln(stdout, "ok")
+	return 0
+}
+
+func cmdDiag(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("satchel-agent diag", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfgPath := fs.String("config", config.DefaultPath, "配置文件位置（用于定位配置与日志目录，文件不存在时仍可诊断）")
+	asJSON := fs.Bool("json", false, "以 JSON 格式输出诊断结果")
+	// 支持把位置参数写在 flag 前（如 satchel-agent diag ports --json），Go 标准 flag 遇位置参数即停，需先分离。
+	var flagArgs, posArgs []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			posArgs = append(posArgs, args[i+1:]...)
+			break
+		}
+		if strings.HasPrefix(a, "-") {
+			flagArgs = append(flagArgs, a)
+			if (a == "--config" || a == "-config") && i+1 < len(args) {
+				i++
+				flagArgs = append(flagArgs, args[i])
+			}
+			continue
+		}
+		posArgs = append(posArgs, a)
+	}
+	if err := fs.Parse(flagArgs); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	posArgs = append(posArgs, fs.Args()...)
+	if len(posArgs) > 1 {
+		fmt.Fprintf(stderr, "diag 最多接受 1 个诊断项名，得到 %v\n", posArgs)
+		return 2
+	}
+
+	var items []string
+	if len(posArgs) == 1 {
+		name := xrpc.NormalizeDiagItem(posArgs[0])
+		if !xrpc.ValidDiagItem(name) {
+			fmt.Fprintf(stderr, "未知诊断项 %q，可选：%s\n", posArgs[0], strings.Join(xrpc.DiagItems, ", "))
+			return 2
+		}
+		items = []string{name}
+	}
+
+	cfgDir := filepath.Dir(*cfgPath)
+	masterURL := ""
+	logCfg := ""
+	if loaded, err := config.Load(*cfgPath); err == nil {
+		masterURL = loaded.MasterURL
+		logCfg = loaded.LogPath
+	}
+	logPath := config.EffectiveLogPath(*cfgPath, logCfg)
+	logDir := filepath.Dir(logPath)
+	coreLog := filepath.Join(logDir, "sing-box.log")
+
+	eng := diag.New(diag.Options{
+		ConfigDir:    cfgDir,
+		MasterURL:    masterURL,
+		AgentVersion: buildinfo.Get().Version,
+		InDocker:     func() bool { return release.InDocker("/") },
+		Nginx:        nginxctl.New(nginxctl.Options{InDocker: func() bool { return release.InDocker("/") }}),
+		Sys:          telemetry.NewSysCollector(telemetry.SysReader{AgentVersion: buildinfo.Get().Version, InDocker: func() bool { return release.InDocker("/") }}),
+		Logs:         telemetry.NewLogInspector(logDir, logPath, coreLog),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := eng.Run(ctx, xrpc.DiagRunParams{Items: items, MasterURL: masterURL, IncludeSecrets: false})
+	if err != nil {
+		fmt.Fprintln(stderr, "执行诊断失败：", err)
+		return 1
+	}
+	if *asJSON {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(res)
+		return 0
+	}
+	for _, it := range res.Items {
+		line := fmt.Sprintf("%-13s %-13s %4dms", it.Name, it.Status, it.DurationMS)
+		if it.Error != "" {
+			line += "  error=" + it.Error
+		}
+		fmt.Fprintln(stdout, line)
+	}
 	return 0
 }
 

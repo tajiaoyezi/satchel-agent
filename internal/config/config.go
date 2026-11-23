@@ -70,6 +70,7 @@ type Config struct {
 	ListenPort      int    `yaml:"listen_port,omitempty"`
 	PullPort        int    `yaml:"pull_port,omitempty"`
 	LogPath         string `yaml:"log_path,omitempty"`
+	AllowExec       bool   `yaml:"allow_exec,omitempty"`
 }
 
 // EffectiveListenPort 返回生效的管理监听端口（未配置时取默认 23889）。

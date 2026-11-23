@@ -17,6 +17,8 @@ import (
 
 	"github.com/satchel/satchel/pkg/xrpc"
 
+	"github.com/satchel/satchel-agent/internal/diag"
+	"github.com/satchel/satchel-agent/internal/execctl"
 	"github.com/satchel/satchel-agent/internal/kernel"
 	"github.com/satchel/satchel-agent/internal/limits"
 	"github.com/satchel/satchel-agent/internal/netprobe"
@@ -100,6 +102,8 @@ type Deps struct {
 	Speed            *telemetry.SpeedCollector
 	Logs             *telemetry.LogInspector
 	ListNICs         func() ([]xrpc.NICInfo, error)
+	Diag             *diag.Engine
+	Exec             *execctl.Manager
 }
 
 func badParams(format string, args ...any) *xrpc.Error {
@@ -297,6 +301,7 @@ func Methods(d Deps) xrpc.Methods {
 	registerNginxAndServiceMethods(m, d)
 	registerNetworkMethods(m, d)
 	registerWarpMethods(m, d)
+	registerDiagAndExecMethods(m, d)
 	if d.Sys != nil {
 		m[xrpc.MethodSystemInfo] = func(context.Context, json.RawMessage) (any, error) {
 			return d.Sys.Info(), nil

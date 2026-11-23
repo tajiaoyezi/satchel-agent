@@ -70,6 +70,7 @@ type Config struct {
 	PullPort     int
 	ConfigPath   string
 	AgentVersion string
+	AllowExec    bool
 	// Methods 是 agent.info / agent.health / token.rotate 之外节点回应的方法（连接管控与流量，见 internal/control）。
 	Methods xrpc.Methods
 	Logger  *slog.Logger
@@ -139,6 +140,8 @@ type Client struct {
 
 	wsMu     sync.Mutex
 	wsCancel context.CancelFunc
+	wsConn   *xrpc.Conn
+	wsCtx    context.Context
 
 	rotateMu     sync.Mutex
 	cleanupMu    sync.Mutex
@@ -821,6 +824,7 @@ func (c *Client) session(ctx context.Context) (authenticated bool, err error) {
 		InDocker:         info.InDocker,
 		MachineID:        info.MachineID,
 		MasterURL:        info.MasterURL,
+		ExecEnabled:      info.ExecEnabled,
 	}
 	if err := conn.Write(dctx, xrpc.TypeAuth, auth); err != nil {
 		return false, fmt.Errorf("发认证消息失败：%w", err)
@@ -858,8 +862,8 @@ func (c *Client) session(ctx context.Context) (authenticated bool, err error) {
 func (c *Client) serve(ctx context.Context, conn *xrpc.Conn, interval time.Duration) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	c.setActiveWSCancel(cancel)
-	defer c.clearActiveWSCancel(cancel)
+	c.setActiveWS(ctx, conn, cancel)
+	defer c.clearActiveWS(conn)
 
 	readErr := make(chan error, 1)
 	go func() { readErr <- c.read(ctx, conn) }()
@@ -872,6 +876,7 @@ func (c *Client) serve(ctx context.Context, conn *xrpc.Conn, interval time.Durat
 			InDocker:     info.InDocker,
 			MachineID:    info.MachineID,
 			MasterURL:    info.MasterURL,
+			ExecEnabled:  info.ExecEnabled,
 		}
 		if err := c.write(ctx, conn, xrpc.TypeHeartbeat, hb); err != nil {
 			return fmt.Errorf("发心跳失败：%w", err)
